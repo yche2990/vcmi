@@ -1,0 +1,70 @@
+# Personal fork only: after a build of yc-custom, publishes the Windows installer and the Android APK
+# as release "yc-latest" with fixed file names:
+#   https://github.com/<owner>/vcmi/releases/latest/download/VCMI-yc-windows-x64.exe
+#   https://github.com/<owner>/vcmi/releases/latest/download/VCMI-yc-android-arm64.apk
+name: YC publish build
+
+on:
+  workflow_run:
+    workflows: ["Daily Builds and Tests"]
+    types: [completed]
+    branches: [yc-custom]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: yc-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion != 'cancelled'
+    steps:
+      - name: Download Windows installer
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          pattern: '*-x64.exe'
+          merge-multiple: true
+          path: dl/windows
+
+      - name: Download Android APK
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          pattern: '*-arm64-v8a.apk'
+          merge-multiple: true
+          path: dl/android
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          mkdir -p out
+          exe=$(find dl/windows -type f -name '*.exe' 2>/dev/null | head -n 1)
+          apk=$(find dl/android -type f -name '*.apk' 2>/dev/null | head -n 1)
+          [ -n "$exe" ] && cp "$exe" out/VCMI-yc-windows-x64.exe
+          [ -n "$apk" ] && cp "$apk" out/VCMI-yc-android-arm64.apk
+          # keep the previous file of a platform that failed to build this time
+          [ -z "$exe" ] && gh release download yc-latest -R "$REPO" -p VCMI-yc-windows-x64.exe -D out 2>/dev/null || true
+          [ -z "$apk" ] && gh release download yc-latest -R "$REPO" -p VCMI-yc-android-arm64.apk -D out 2>/dev/null || true
+          ls -la out
+          if [ -z "$exe" ] && [ -z "$apk" ]; then
+            echo "::error::Neither the Windows installer nor the Android APK was built in $RUN_URL"
+            exit 1
+          fi
+          notes="Commit ${SHA:0:9}, built $(date -u '+%Y-%m-%d %H:%M') UTC. Build log: $RUN_URL"
+          [ -z "$exe" ] && notes="$notes"$'\n'"Windows installer failed to build this time, the file is from an earlier build."
+          [ -z "$apk" ] && notes="$notes"$'\n'"Android APK failed to build this time, the file is from an earlier build."
+          gh release delete yc-latest -R "$REPO" --yes --cleanup-tag 2>/dev/null || true
+          gh release create yc-latest out/* -R "$REPO" --target "$SHA" --title "VCMI yc-custom" --notes "$notes" --latest
