@@ -861,12 +861,17 @@ CLoadingScreen::CLoadingScreen(ImagePath background)
 
 		backimg = std::make_shared<CPicture>(backimgPath);
 
-		// "backgroundVideos" : { "<background image>" : { "name" : "<video>", "x" : 0, "y" : 0 } }
+		// "backgroundVideos" : { "<background image>" : { "intro" : "<played once, optional>", "name" : "<looped>", "x" : 0, "y" : 0 } }
 		for (const auto & [imageName, videoConfig] : conf["backgroundVideos"].Struct())
 		{
 			if (ImagePath::builtin(imageName) != backimgPath)
 				continue;
-			videoPlayer = std::make_shared<VideoWidget>(Point(videoConfig["x"].Integer(), videoConfig["y"].Integer()), VideoPath::fromJson(videoConfig["name"]), false);
+			Point videoPos(videoConfig["x"].Integer(), videoConfig["y"].Integer());
+			VideoPath looped = VideoPath::fromJson(videoConfig["name"]);
+			if (videoConfig["intro"].isString())
+				videoPlayer = std::make_shared<VideoWidget>(videoPos, VideoPath::fromJson(videoConfig["intro"]), looped, false);
+			else
+				videoPlayer = std::make_shared<VideoWidget>(videoPos, looped, false);
 			break;
 		}
 	}
