@@ -228,4 +228,5 @@ public:
 	~CLoadingScreen();
 
 	void tick(uint32_t msPassed) override;
+	void show(Canvas & to) override;
 };

@@ -922,6 +922,15 @@ void CLoadingScreen::tick(uint32_t msPassed)
 	}
 }
 
+void CLoadingScreen::show(Canvas & to)
+{
+	// The video is drawn every frame, so everything above it (images, loadframe, loadbar) has to be redrawn too
+	if(videoPlayer)
+		showAll(to);
+	else
+		CWindowObject::show(to);
+}
+
 ImagePath CLoadingScreen::getBackground()
 {
 	ImagePath fname = ImagePath::builtin("loadbar");
