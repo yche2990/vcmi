@@ -215,6 +215,7 @@ public:
 class CLoadingScreen : virtual public CWindowObject, virtual public Load::Progress
 {
 	std::shared_ptr<CPicture> backimg;
+	std::shared_ptr<VideoWidget> videoPlayer;
 	std::vector<std::shared_ptr<CPicture>> images;
 	std::shared_ptr<CPicture> loadFrame;
 	std::vector<std::shared_ptr<CAnimImage>> progressBlocks;

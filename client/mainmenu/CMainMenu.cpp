@@ -848,7 +848,28 @@ CLoadingScreen::CLoadingScreen(ImagePath background)
 
 	const auto& backgroundConfig = conf["background"];
 	if (!backgroundConfig.Vector().empty())
-		backimg = std::make_shared<CPicture>(ImagePath::fromJson(*RandomGeneratorUtil::nextItem(backgroundConfig.Vector(), CRandomGenerator::getDefault())));
+	{
+		// Reuse the background already picked for the window, so that its video matches.
+		// Campaign backgrounds are not in the list and still get a random picture on top, as before
+		ImagePath backimgPath = background;
+		bool inList = false;
+		for (const JsonNode & entry : backgroundConfig.Vector())
+			if (ImagePath::fromJson(entry) == background)
+				inList = true;
+		if (!inList)
+			backimgPath = ImagePath::fromJson(*RandomGeneratorUtil::nextItem(backgroundConfig.Vector(), CRandomGenerator::getDefault()));
+
+		backimg = std::make_shared<CPicture>(backimgPath);
+
+		// "backgroundVideos" : { "<background image>" : { "name" : "<video>", "x" : 0, "y" : 0 } }
+		for (const auto & [imageName, videoConfig] : conf["backgroundVideos"].Struct())
+		{
+			if (ImagePath::builtin(imageName) != backimgPath)
+				continue;
+			videoPlayer = std::make_shared<VideoWidget>(Point(videoConfig["x"].Integer(), videoConfig["y"].Integer()), VideoPath::fromJson(videoConfig["name"]), false);
+			break;
+		}
+	}
 
 	for (const JsonNode& node : conf["images"].Vector())
 	{
