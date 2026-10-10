@@ -74,6 +74,7 @@ jobs:
           SHA: ${{ steps.run.outputs.sha }}
           RUN_URL: ${{ steps.run.outputs.url }}
         run: |
+          trap 'echo "::error::Publish failed at line $LINENO: $BASH_COMMAND"' ERR
           mkdir -p out
           exe=$(find dl/windows -type f -name '*.exe' | head -n 1 || true)
           apk=$(find dl/android -type f -name '*.apk' | head -n 1 || true)
@@ -91,4 +92,7 @@ jobs:
           [ -z "$exe" ] && notes="$notes"$'\n'"Windows installer failed to build this time, the file is from an earlier build."
           [ -z "$apk" ] && notes="$notes"$'\n'"Android APK failed to build this time, the file is from an earlier build."
           gh release delete yc-latest -R "$REPO" --yes --cleanup-tag 2>/dev/null || true
-          gh release create yc-latest out/* -R "$REPO" --target "$SHA" --title "VCMI yc-custom" --notes "$notes" --latest
+          if ! err=$(gh release create yc-latest out/* -R "$REPO" --target "$SHA" --title "VCMI yc-custom" --notes "$notes" --latest 2>&1); then
+            echo "::error::gh release create: ${err//$'\n'/ }"
+            exit 1
+          fi
