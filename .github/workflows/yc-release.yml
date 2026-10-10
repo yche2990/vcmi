@@ -69,7 +69,8 @@ jobs:
 
       - name: Publish release
         env:
-          GH_TOKEN: ${{ github.token }}
+          # GITHUB_TOKEN may be read-only in this fork, the sync token can write releases
+          GH_TOKEN: ${{ secrets.YC_SYNC_TOKEN || github.token }}
           REPO: ${{ github.repository }}
           SHA: ${{ steps.run.outputs.sha }}
           RUN_URL: ${{ steps.run.outputs.url }}
