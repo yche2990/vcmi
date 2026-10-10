@@ -9,6 +9,11 @@ on:
     workflows: ["Daily Builds and Tests"]
     types: [completed]
     branches: [yc-custom]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'ID of a finished "Daily Builds and Tests" run of yc-custom'
+        required: true
 
 permissions:
   contents: write
@@ -21,13 +26,22 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    if: github.event.workflow_run.conclusion != 'cancelled'
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion != 'cancelled'
     steps:
+      - name: Resolve build run
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+        run: |
+          echo "id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID" --jq '"sha=\(.head_sha)\nurl=\(.html_url)"' >> "$GITHUB_OUTPUT"
+
       - name: Download Windows installer
         continue-on-error: true
         uses: actions/download-artifact@v8
         with:
-          run-id: ${{ github.event.workflow_run.id }}
+          run-id: ${{ steps.run.outputs.id }}
           github-token: ${{ github.token }}
           pattern: '*-x64.exe'
           merge-multiple: true
@@ -37,7 +51,7 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@v8
         with:
-          run-id: ${{ github.event.workflow_run.id }}
+          run-id: ${{ steps.run.outputs.id }}
           github-token: ${{ github.token }}
           pattern: '*-arm64-v8a.apk'
           merge-multiple: true
@@ -47,8 +61,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          SHA: ${{ github.event.workflow_run.head_sha }}
-          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          SHA: ${{ steps.run.outputs.sha }}
+          RUN_URL: ${{ steps.run.outputs.url }}
         run: |
           mkdir -p out
           exe=$(find dl/windows -type f -name '*.exe' 2>/dev/null | head -n 1)
