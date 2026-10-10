@@ -1,7 +1,8 @@
 # Personal fork only: after a build of yc-custom, publishes the Windows installer and the Android APK
 # as release "yc-latest" with fixed file names:
-#   https://github.com/<owner>/vcmi/releases/latest/download/VCMI-yc-windows-x64.exe
-#   https://github.com/<owner>/vcmi/releases/latest/download/VCMI-yc-android-arm64.apk
+#   https://github.com/<owner>/vcmi/releases/download/yc-latest/VCMI-yc-windows-x64.exe
+#   https://github.com/<owner>/vcmi/releases/download/yc-latest/VCMI-yc-android-arm64.apk
+# Marked as pre-release so that the upstream "Notify other repos of release" workflow skips it.
 name: YC publish build
 
 on:
@@ -93,7 +94,7 @@ jobs:
           [ -z "$exe" ] && notes="$notes"$'\n'"Windows installer failed to build this time, the file is from an earlier build."
           [ -z "$apk" ] && notes="$notes"$'\n'"Android APK failed to build this time, the file is from an earlier build."
           gh release delete yc-latest -R "$REPO" --yes --cleanup-tag 2>/dev/null || true
-          if ! err=$(gh release create yc-latest out/* -R "$REPO" --target "$SHA" --title "VCMI yc-custom" --notes "$notes" --latest 2>&1); then
+          if ! err=$(gh release create yc-latest out/* -R "$REPO" --target "$SHA" --title "VCMI yc-custom" --notes "$notes" --prerelease 2>&1); then
             echo "::error::gh release create: ${err//$'\n'/ }"
             exit 1
           fi
