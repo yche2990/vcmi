@@ -16,7 +16,7 @@
         "models" : {
             "type" : "object",
             "additionalProperties" : false,
-            "required" : [ "attacker", "attacker.siege", "defender", "defender.siege" ],
+            "required" : [ "attacker", "defender" ],
             "properties" : {
                 "attacker" : { "type" : "string" },
                 "defender" : { "type" : "string" },
@@ -36,6 +36,23 @@
         "seed" : {
             "type" : "number",
             "default" : 0
+        },
+        "delegateToBattleAI" : {
+            "type" : "object",
+            "additionalProperties" : false,
+            "description" : "Unit types that are controlled by BattleAI logic instead of the model",
+            "properties" : {
+                "creatureSpells" : {
+                    "type" : "boolean",
+                    "default" : false,
+                    "description" : "Units with active spellcasting ability ask BattleAI first and cast a spell if BattleAI would"
+                },
+                "healerMachines" : {
+                    "type" : "boolean",
+                    "default" : false,
+                    "description" : "Ignored, kept for older settings files: MMAI now heals with every healing war machine"
+                }
+            }
         }
     }
 }

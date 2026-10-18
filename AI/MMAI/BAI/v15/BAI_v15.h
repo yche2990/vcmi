@@ -12,6 +12,7 @@
 
 #include "AI/MMAI/common.h" // IWYU pragma: keep
 
+#include "BAI/delegation.h"
 #include "BAI/logger.h"
 #include "BAI/v15/state_v15.h"
 #include "TacticsHandler.h"
@@ -29,7 +30,8 @@ public:
 		const std::shared_ptr<Environment> & env,
 		const std::shared_ptr<CBattleCallback> & cb,
 		bool enableSpells,
-		bool enableTactics);
+		bool enableTactics,
+		const BattleAIDelegation & delegation = {});
 
 	void activeStack(const BattleID & bid, const CStack * stack) override;
 	void battleNewRound(const BattleID & bid) override;
@@ -70,6 +72,7 @@ public:
 
 	bool enableSpells = false;
 	bool enableTactics = false;
+	const BattleAIDelegation delegation;
 
 	// consecutive invalid actions counter
 	int errcounter = 0;
@@ -89,6 +92,7 @@ public:
 	std::shared_ptr<BattleAction> buildBattleAction(const ActionPtr & a, const CStack * acstack) const;
 	std::shared_ptr<BattleAction> maybeBuildAutoAction(const CStack * stack, const BattleID & bid) const;
 	bool maybeCastSpell(const CStack * stack, const BattleID & bid);
+	bool maybeCastCreatureSpell(const CStack * stack, const BattleID & bid);
 	void _activeStack(const BattleID & bid, const CStack * stack);
 	bool guardVip(const BattleID & bid, const CStack * guard, const CStack * vip);
 	void tacticMove(const BattleID & bid, const CStack * cstack, const BattleHex & bh);

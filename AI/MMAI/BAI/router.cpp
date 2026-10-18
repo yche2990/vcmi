@@ -42,6 +42,7 @@ namespace
 		std::map<std::string, std::string> paths;
 		std::shared_ptr<ScriptedModel> fallbackModel;
 		std::string fallbackName;
+		BattleAIDelegation delegation;
 	};
 
 	std::shared_ptr<ModelRepository> InitModelRepository()
@@ -63,6 +64,9 @@ namespace
 				repo->paths.try_emplace(key, "MMAI/models/" + node.String());
 
 			fallback = json["fallback"].isNull() ? "BattleAI" : json["fallback"].String();
+
+			const auto & delegation = json["delegateToBattleAI"];
+			repo->delegation.creatureSpells = delegation["creatureSpells"].Bool();
 		}
 		else
 		{
@@ -71,6 +75,7 @@ namespace
 		}
 
 		logAi->debug("MMAI: repo initialized with fallback: %s", fallback);
+		logAi->debug("MMAI: delegated to BattleAI: creature spells: %d", repo->delegation.creatureSpells);
 		repo->fallbackModel = std::make_unique<ScriptedModel>(fallback);
 		repo->fallbackName = fallback;
 
@@ -333,7 +338,14 @@ void Router::battleStart(
 			break;
 		case Schema::ModelType::NN:
 			// XXX: must not call initBattleInterface here
-			bai = CreateBAI(model, env, cb, autocombatPreferences.enableSpellsUsage, autocombatPreferences.enableTacticsUsage);
+			bai = CreateBAI(
+				model,
+				env,
+				cb,
+				autocombatPreferences.enableSpellsUsage,
+				autocombatPreferences.enableTacticsUsage,
+				GetModelRepository()->delegation
+			);
 			break;
 
 		default:

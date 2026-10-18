@@ -7,6 +7,7 @@ endif()
 
 set(MMAI_FILES
   BAI/logger.h
+  BAI/delegation.h
   BAI/factory.h
   BAI/factory.cpp
   BAI/router.cpp

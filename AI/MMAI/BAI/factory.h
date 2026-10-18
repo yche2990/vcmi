@@ -12,6 +12,8 @@
 
 #include "AI/MMAI/common.h" // IWYU pragma: keep
 
+#include "BAI/delegation.h"
+
 #include "callback/CBattleGameInterface.h"
 #include "schema/base.h"
 #include <onnxruntime_cxx_api.h>
@@ -45,6 +47,13 @@ struct NNContainer
 std::shared_ptr<MMAI::Schema::IModel> CreateNNModel(const std::string & path, float temperature = 1.0, uint64_t seed = 0);
 
 std::shared_ptr<CBattleGameInterface>
-CreateBAI(Schema::IModel * model, const std::shared_ptr<Environment> & env, const std::shared_ptr<CBattleCallback> & cb, bool enableSpells, bool enableTactics);
+CreateBAI(
+	Schema::IModel * model,
+	const std::shared_ptr<Environment> & env,
+	const std::shared_ptr<CBattleCallback> & cb,
+	bool enableSpells,
+	bool enableTactics,
+	const BattleAIDelegation & delegation = {}
+);
 
 }
