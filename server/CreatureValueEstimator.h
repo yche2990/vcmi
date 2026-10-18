@@ -12,6 +12,7 @@
 #include "../lib/battle/BattleHex.h"
 #include "../lib/battle/CombatValue.h"
 #include "../lib/battle/BattleSide.h"
+#include "../lib/constants/EntityIdentifiers.h"
 
 class CCreature;
 class CGameState;
@@ -26,8 +27,10 @@ class IMapService;
 class CreatureValueEstimator
 {
 public:
-	/// Measures every loaded creature and logs derived values next to configured ones
-	static void run();
+	/// Measures every loaded creature and logs derived values next to configured ones.
+	/// With experienceRank above zero every measured stack has that stack experience rank,
+	/// so that bonuses from stack experience tables are included in the result
+	static void run(int experienceRank = 0);
 
 private:
 	/// Initial positions of creatures to be tested
@@ -60,6 +63,11 @@ private:
 	};
 
 	class BattlegroundMapService;
+
+	/// Stack experience rank given to every placed stack, 0 for none
+	int experienceRank = 0;
+	/// Army slots holding the stacks that experienced units are created from, by unit id
+	std::map<uint32_t, std::pair<CGHeroInstance *, SlotID>> experiencedStacks;
 
 	std::shared_ptr<CGameState> gameState;
 	std::unique_ptr<IMapService> mapService;

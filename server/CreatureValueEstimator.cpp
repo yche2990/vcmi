@@ -39,9 +39,10 @@
 #include "../lib/mapping/MapEditUtils.h"
 #include "../lib/mapping/MapFormat.h"
 
-void CreatureValueEstimator::run()
+void CreatureValueEstimator::run(int experienceRank)
 {
 	CreatureValueEstimator estimator;
+	estimator.experienceRank = std::max(0, experienceRank);
 
 	estimator.startGame();
 	estimator.startBattle();
@@ -222,6 +223,30 @@ CStack * CreatureValueEstimator::placeStack(BattleSide side, const CCreature * c
 
 CStack * CreatureValueEstimator::placeStack(BattleSide side, const CCreature * creature, const BattleHex & hex, int count)
 {
+	if(experienceRank > 0)
+	{
+		// stack experience is read from the army stack a unit comes from, so the unit needs one
+		CGHeroInstance * hero = side == BattleSide::ATTACKER ? attackerSideHero : defenderSideHero;
+		const SlotID slot = hero->getFreeSlot();
+		if(!slot.validSlot())
+			throw std::runtime_error("No free army slot to place an experienced stack in");
+
+		const auto & ranks = LIBRARY->creh->expRanks.at(vstd::iswithin(creature->getLevel(), 1, 7) ? creature->getLevel() : 0);
+		const int rank = std::clamp<int>(experienceRank, 1, static_cast<int>(ranks.size()) - 1);
+
+		auto instance = std::make_unique<CStackInstance>(gameState.get(), creature->getId(), count);
+		instance->giveTotalStackExperience(static_cast<TExpType>(ranks.at(rank - 1)) * count);
+		hero->putStack(slot, std::move(instance));
+
+		const uint32_t id = battle()->battleNextUnitId();
+		battle()->generateNewStack(id, *hero->getStackPtr(slot), side, slot, hex);
+		CStack * unit = battle()->stacks.back().get();
+		unit->initialPosition = hex;
+		unit->localInit(battle());
+		experiencedStacks[id] = {hero, slot};
+		return unit;
+	}
+
 	battle::UnitInfo info;
 	info.id = battle()->battleNextUnitId();
 	info.count = count;
@@ -247,7 +272,14 @@ void CreatureValueEstimator::removeStack(const CStack * stack)
 	gameState->apply(pack);
 
 	// battle keeps removed units around so they can be raised, but this code makes far too many
+	const uint32_t id = stack->unitId();
 	std::erase_if(battle()->stacks, [stack](const std::unique_ptr<CStack> & entry) { return entry.get() == stack; });
+
+	if(auto it = experiencedStacks.find(id); it != experiencedStacks.end())
+	{
+		it->second.first->eraseStack(it->second.second);
+		experiencedStacks.erase(it);
+	}
 }
 
 void CreatureValueEstimator::measurePair(const CStack * attacker, const CStack * defender, double & dealt, double & retaliated) const
@@ -465,6 +497,7 @@ void CreatureValueEstimator::checkModelPaths()
 
 void CreatureValueEstimator::report() const
 {
+	logGlobal->info("Creature values measured at stack experience rank %d", experienceRank);
 	logGlobal->info("creature,fightValue,derivedFightValue,formulaFightValue,aiValue,derivedAiValue,formulaAiValue");
 
 	int agreed = 0;
