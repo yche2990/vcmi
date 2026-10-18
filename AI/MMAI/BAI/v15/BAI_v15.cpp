@@ -16,8 +16,11 @@
 #include "battle/BattleHex.h"
 #include "battle/BattleStateInfoForRetreat.h"
 #include "battle/CBattleInfoEssentials.h"
+#include "battle/CombatValue.h"
 #include "battle/ReachabilityInfo.h"
 #include "callback/CBattleCallback.h"
+#include "callback/IGameInfoCallback.h"
+#include "StartInfo.h"
 
 #include "AI/MMAI/common.h"
 #include "BAI/v15/render_v15.h"
@@ -41,9 +44,17 @@ BAI::BAI(
 	const std::shared_ptr<Environment> & env,
 	const std::shared_ptr<CBattleCallback> & cb,
 	bool enableSpells,
-	bool enableTactics
+	bool enableTactics,
+	const BattleAIDelegation & delegation
 )
-	: model(model), version(version), logger(cb->getPlayerID().value().toString()), env(env), cb(cb), enableSpells(enableSpells), enableTactics(enableTactics)
+	: model(model)
+	, version(version)
+	, logger(cb->getPlayerID().value().toString())
+	, env(env)
+	, cb(cb)
+	, enableSpells(enableSpells)
+	, enableTactics(enableTactics)
+	, delegation(delegation)
 {
 }
 
@@ -180,9 +191,52 @@ bool BAI::maybeCastSpell(const CStack * astack, const BattleID & bid)
 	return evaluator.attemptCastingSpell(astack);
 }
 
+bool BAI::maybeCastCreatureSpell(const CStack * astack, const BattleID & bid)
+{
+	if(!delegation.creatureSpells || !astack->canCast())
+		return false;
+
+	if(!astack->hasBonusOfType(BonusType::SPELLCASTER) && !astack->hasBonusOfType(BonusType::RANDOM_SPELLCASTER))
+		return false;
+
+	// Same strength ratio and simulation depth as CBattleAI::activeStack,
+	// so that the unit makes exactly the choice BattleAI would make for it
+	const auto mySide = battle->battleGetMySide();
+	const auto ourEnemy = CombatValueContext::against(*battle, mySide);
+	const auto theirEnemy = CombatValueContext::against(*battle, CBattleInfoEssentials::otherSide(mySide));
+	uint64_t our = 0;
+	uint64_t enemy = 0;
+	for(const auto * stack : battle->battleGetAllStacks())
+	{
+		if(stack->unitSide() == mySide)
+			our += stack->estimateCombatValue(ourEnemy);
+		else
+			enemy += stack->estimateCombatValue(theirEnemy);
+	}
+	const float strengthRatio = enemy == 0 ? 1.0f : static_cast<float>(our) / static_cast<float>(enemy);
+	const int simulationTurns = env->game()->getStartInfo()->difficulty < 4 ? 2 : 10;
+
+	// BattleAI decides between casting and attacking, as it does for its own units.
+	// Only a spellcast is taken from it, any other action is left to the model.
+	logger.debug("Asking BattleAI whether %s should cast a spell", astack->getDescription());
+	auto evaluator = BattleEvaluator(env, cb, astack, cb->getPlayerID().value(), bid, mySide, strengthRatio, simulationTurns);
+	auto ba = evaluator.selectStackAction(astack);
+
+	if(ba.actionType != EActionType::MONSTER_SPELL)
+		return false;
+
+	logger.info("BattleAI casts a creature spell with %s", astack->getDescription());
+	cb->battleMakeUnitAction(bid, ba);
+	return true;
+}
+
 std::shared_ptr<BattleAction> BAI::maybeBuildAutoAction(const CStack * astack, const BattleID & bid) const
 {
-	if(astack->creatureId() == CreatureID::FIRST_AID_TENT)
+	// BattleAI heals with every healing war machine, MMAI only with the original First Aid Tent unless configured otherwise
+	const bool isHealerMachine = astack->creatureId() == CreatureID::FIRST_AID_TENT
+		|| (delegation.healerMachines && astack->hasBonusOfType(BonusType::SIEGE_WEAPON) && astack->hasBonusOfType(BonusType::HEALER));
+
+	if(isHealerMachine)
 	{
 		const CStack * target = nullptr;
 		auto maxdmg = 0;
@@ -377,6 +431,9 @@ void BAI::_activeStack(const BattleID & bid, const CStack * astack)
 	}
 
 	logger.debug("Not conceding.");
+
+	if(maybeCastCreatureSpell(astack, bid))
+		return;
 
 	auto t0 = std::chrono::steady_clock::now();
 	int a = getNonRenderAction();
