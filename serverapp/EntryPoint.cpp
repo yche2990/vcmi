@@ -236,6 +236,7 @@ static void handleCommandOptions(int argc, const char * argv[], boost::program_o
 	("run-by-client", "indicate that server launched by client on same machine")
 	("dummy-run", "Shutdown immediately after loading was sucessful")
 	("creature-values", "Compute AI values and fight values of all creatures and compare them against configured values")
+	("creature-values-rank", boost::program_options::value<int>(), "Same as creature-values, with every measured stack at given stack experience rank")
 	("translate-mod", boost::program_options::value<std::string>(), "Export translations for specified mod")
 	("export-lua-docs", boost::program_options::value<std::string>(), "Export Lua scripting API documentation to specified directory")
 	("port", boost::program_options::value<ui16>(), "port at which server will listen to connections from client")
@@ -307,9 +308,9 @@ int main(int argc, const char * argv[])
 
 	LIBRARY->initializeLibrary();
 
-	if(opts.count("creature-values"))
+	if(opts.count("creature-values") || opts.count("creature-values-rank"))
 	{
-		CreatureValueEstimator::run();
+		CreatureValueEstimator::run(opts.count("creature-values-rank") ? opts["creature-values-rank"].as<int>() : 0);
 	}
 	else if(!opts.count("dummy-run"))
 	{
