@@ -16,6 +16,7 @@
 #include "../../../lib/json/JsonNode.h"
 #include "../../../lib/mapObjects/CGHeroInstance.h"
 #include "../../../lib/bonuses/BonusParameters.h"
+#include "../../../lib/bonuses/Updaters.h"
 
 namespace test
 {
@@ -279,6 +280,39 @@ TEST_F(TimedTest, ConvertBonusKeepsExplicitTurnsRemain)
 
 	ASSERT_EQ(actualBonus.size(), 1u);
 	EXPECT_EQ(actualBonus[0].turnsRemain, customDuration);
+}
+
+TEST_F(TimedTest, ApplyKeepsBonusUpdater)
+{
+	Bonus b(BonusDuration::PERMANENT, BonusType::PRIMARY_SKILL, BonusSource::OTHER, 1, BonusSourceID(), BonusSubtypeID(PrimarySkill::ATTACK));
+	JsonNode options;
+	options["bonus"]["test"] = b.toJsonNode();
+	options["bonus"]["test"]["updater"].String() = "TIMES_STACK_LEVEL";
+	options.setModScope(ModScope::scopeBuiltin());
+	setupEffect(options);
+
+	auto & unit = unitsFake.add(BattleSide::ATTACKER);
+	unit.makeAlive();
+	EXPECT_CALL(unit, unitId()).WillRepeatedly(Return(42u));
+	EXPECT_CALL(unit, creatureLevel()).WillRepeatedly(Return(1));
+	unitsFake.setDefaultBonusExpectations();
+
+	EXPECT_CALL(mechanicsMock, getSpell()).WillRepeatedly(Return(&spellStub));
+	EXPECT_CALL(spellStub, getJsonKey()).WillRepeatedly(Return(SpellID::encode(testSpellId.getNum())));
+	EXPECT_CALL(mechanicsMock, getEffectDuration()).WillRepeatedly(Return(1));
+	EXPECT_CALL(serverMock, describeChanges()).WillRepeatedly(Return(false));
+
+	Target target;
+	target.emplace_back(&unit, BattleHex());
+
+	std::vector<Bonus> actualBonus;
+	EXPECT_CALL(*battleFake, updateUnitBonus(_, _)).WillOnce(SaveArg<1>(&actualBonus));
+	EXPECT_CALL(serverMock, apply(Matcher<SetStackEffect &>(_))).Times(1);
+
+	subject->apply(&serverMock, &mechanicsMock, target);
+
+	ASSERT_EQ(actualBonus.size(), 1u);
+	EXPECT_NE(dynamic_cast<const TimesStackLevelUpdater *>(actualBonus[0].updater.get()), nullptr);
 }
 
 TEST_F(TimedTest, ConvertBonusInvertsShieldDamageReduction)
