@@ -44,7 +44,7 @@ namespace
 {
 
 /// Total value of units on each side at the start of a battle, in units of configured AI value
-constexpr double armyBudget = 60000;
+constexpr double armyBudget = 100000;
 /// Battles at each searched number of opponents
 constexpr int battlesPerStep = 3;
 constexpr int maxSteps = 6;
@@ -94,7 +94,7 @@ struct PendingEvent
 	BattleID battleID;
 	PlayerColor player;
 	/// Unit waiting for its player
-	uint32_t unit = 0;
+	int32_t unit = -1;
 	BattleAction action;
 };
 
@@ -414,7 +414,7 @@ void DuelServer::applyPack(CPackForClient & pack)
 
 		PendingEvent event;
 		event.battleID = activation->battleID;
-		event.unit = activation->stack;
+		event.unit = static_cast<int32_t>(activation->stack);
 		// player of the other side, if the unit is hypnotized
 		event.player = battle->battleGetOwner(stack);
 		pending.push_back(event);

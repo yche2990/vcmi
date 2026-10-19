@@ -142,8 +142,8 @@ void BattlegroundGame::stripHeroBonuses(CGHeroInstance * hero)
 	for(const auto & bonus : hero->getHeroType()->specialty)
 		hero->removeBonus(bonus);
 
-	for(int index = 0; index < LIBRARY->skillh->size(); ++index)
-		hero->setSecSkillLevel(SecondarySkill(index), 0, ChangeValueMode::ABSOLUTE);
+	for(size_t index = 0; index < LIBRARY->skillh->size(); ++index)
+		hero->setSecSkillLevel(SecondarySkill(static_cast<int32_t>(index)), 0, ChangeValueMode::ABSOLUTE);
 
 	for(auto skill : {PrimarySkill::ATTACK, PrimarySkill::DEFENSE, PrimarySkill::SPELL_POWER, PrimarySkill::KNOWLEDGE})
 		hero->setPrimarySkill(skill, 0, ChangeValueMode::ABSOLUTE);

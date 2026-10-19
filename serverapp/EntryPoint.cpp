@@ -344,21 +344,25 @@ static std::string serverLogName(int argc, const char * argv[])
 		return "VCMI_Server_log.txt";
 
 	boost::replace_all(shard, "/", "-");
-	shard.erase(std::remove_if(shard.begin(), shard.end(), [](char symbol){ return !std::isdigit(static_cast<unsigned char>(symbol)) && symbol != '-'; }), shard.end());
+	shard.erase(std::remove_if(shard.begin(), shard.end(), [](char symbol){ return (symbol < '0' || symbol > '9') && symbol != '-'; }), shard.end());
 	return shard.empty() ? "VCMI_Server_duels_log.txt" : "VCMI_Server_duels_" + shard + "_log.txt";
+}
+
+/// Every battle AI decision is logged at trace level, which would slow duels down many times, and
+/// several processes loading all mods at once should not each write a log of every loaded file
+static void limitLogLevel(ELogLevel::ELogLevel lowest)
+{
+	CLogger::getGlobalLogger()->setLevel(lowest);
+	for(const auto & loggerNode : settings["logging"]["loggers"].Vector())
+	{
+		CLogger * logger = CLogger::getLogger(CLoggerDomain(loggerNode["domain"].String()));
+		if(logger->getLevel() < lowest)
+			logger->setLevel(lowest);
+	}
 }
 
 static void runCreatureDuels(const boost::program_options::variables_map & opts)
 {
-	// every battle AI decision is logged at trace level, which would slow duels down many times
-	CLogger::getGlobalLogger()->setLevel(ELogLevel::INFO);
-	for(const auto & loggerNode : settings["logging"]["loggers"].Vector())
-	{
-		CLogger * logger = CLogger::getLogger(CLoggerDomain(loggerNode["domain"].String()));
-		if(logger->getLevel() < ELogLevel::INFO)
-			logger->setLevel(ELogLevel::INFO);
-	}
-
 	CreatureDuels::Options options;
 	options.output = opts["creature-duels"].as<std::string>();
 	if(opts.count("creature-duels-rank"))
@@ -390,6 +394,9 @@ int main(int argc, const char * argv[])
 	LIBRARY = new GameLibrary;
 	LIBRARY->initializeFilesystem(false);
 	logConfigurator.configure();
+
+	if(opts.count("creature-duels"))
+		limitLogLevel(ELogLevel::INFO);
 
 	LIBRARY->initializeLibrary();
 

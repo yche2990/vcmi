@@ -106,5 +106,4 @@ private:
 	void removeStack(const CStack * stack);
 	/// Measures one ordered pair, returning damage dealt and taken back, per single creature
 	void measurePair(const CStack * attacker, const CStack * defender, double & dealt, double & retaliated) const;
-
 };
