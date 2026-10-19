@@ -19,7 +19,7 @@ class CGameState;
 class CGHeroInstance;
 class CStack;
 class BattleInfo;
-class IMapService;
+class BattlegroundGame;
 
 /// Computes fight value and AI value of every loaded creature by simulating battles between each
 /// possible pair of creatures. H3 creatures serve as a baseline, modded creatures are valued by
@@ -62,15 +62,13 @@ private:
 		bool baseline = false;
 	};
 
-	class BattlegroundMapService;
-
 	/// Stack experience rank given to every placed stack, 0 for none
 	int experienceRank = 0;
 	/// Army slots holding the stacks that experienced units are created from, by unit id
 	std::map<uint32_t, std::pair<CGHeroInstance *, SlotID>> experiencedStacks;
 
+	std::unique_ptr<BattlegroundGame> game;
 	std::shared_ptr<CGameState> gameState;
-	std::unique_ptr<IMapService> mapService;
 	CGHeroInstance * attackerSideHero = nullptr;
 	CGHeroInstance * defenderSideHero = nullptr;
 
@@ -109,6 +107,4 @@ private:
 	/// Measures one ordered pair, returning damage dealt and taken back, per single creature
 	void measurePair(const CStack * attacker, const CStack * defender, double & dealt, double & retaliated) const;
 
-	/// Strips everything from a hero that could modify battle results
-	static void stripHeroBonuses(CGHeroInstance * hero);
 };

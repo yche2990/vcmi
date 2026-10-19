@@ -10,34 +10,21 @@
 #include "StdInc.h"
 
 #include "CreatureValueEstimator.h"
+#include "BattlegroundGame.h"
 
 #include "../lib/CCreatureHandler.h"
-#include "../lib/CRandomGenerator.h"
-#include "../lib/CSkillHandler.h"
 #include "../lib/CStack.h"
 #include "../lib/GameLibrary.h"
-#include "../lib/LoadProgress.h"
-#include "../lib/StartInfo.h"
 #include "../lib/battle/BattleInfo.h"
 #include "../lib/battle/BattleLayout.h"
 #include "../lib/battle/CUnitState.h"
 #include "../lib/battle/CombatValue.h"
 #include "../lib/bonuses/Bonus.h"
-#include "../lib/callback/GameRandomizer.h"
-#include "../lib/entities/hero/CHero.h"
 #include "../lib/gameState/CGameState.h"
 #include "../lib/mapObjects/CGHeroInstance.h"
-#include "../lib/mapping/CMap.h"
-#include "../lib/mapping/CMapService.h"
-#include "../lib/modding/IdentifierStorage.h"
+#include "../lib/mapping/TerrainTile.h"
 #include "../lib/modding/ModScope.h"
 #include "../lib/networkPacks/PacksForClientBattle.h"
-#include "../lib/entities/hero/CHeroClass.h"
-#include "../lib/mapObjectConstructors/AObjectTypeHandler.h"
-#include "../lib/mapObjectConstructors/CObjectClassesHandler.h"
-#include "../lib/mapping/CMapEditManager.h"
-#include "../lib/mapping/MapEditUtils.h"
-#include "../lib/mapping/MapFormat.h"
 
 void CreatureValueEstimator::run(int experienceRank)
 {
@@ -54,115 +41,12 @@ void CreatureValueEstimator::run(int experienceRank)
 	estimator.report();
 }
 
-/// The smallest game a battle can happen in: bare terrain and one hero per side. Built here rather
-/// than generated, since a random map takes minutes and depends on templates of loaded mods
-class CreatureValueEstimator::BattlegroundMapService final : public IMapService
-{
-public:
-	std::unique_ptr<CMap> loadMap(const ResourcePath &, IGameInfoCallback * cb) const override
-	{
-		auto map = std::make_unique<CMap>(cb);
-
-		map->version = EMapFormat::VCMI;
-		map->creationDateTime = std::time(nullptr);
-		map->width = mapSize;
-		map->height = mapSize;
-		map->mapLayers = {MapLayerId::SURFACE};
-		map->name.appendRawString("Battleground");
-		map->initTerrain();
-		// sand is native to no faction, so nobody gains the native terrain bonus
-		map->getEditManager()->getTerrainSelection().selectAll();
-		map->getEditManager()->drawTerrain(ETerrainId::SAND, 0, &CRandomGenerator::getDefault());
-
-		for(int index = 0; index < 2; ++index)
-		{
-			PlayerInfo & player = map->players.at(index);
-			player.canHumanPlay = true;
-			player.canComputerPlay = true;
-			player.isFactionRandom = true;
-
-			placeHero(*map, cb, PlayerColor(index), HeroTypeID(index), int3(2 + index * 4, 2, 0));
-		}
-
-		return map;
-	}
-
-	std::unique_ptr<CMapHeader> loadMapHeader(const ResourcePath &, bool = false) const override { return nullptr; }
-	std::unique_ptr<CMap> loadMap(const ui8 *, int, const std::string &, const std::string &, const std::string &, IGameInfoCallback *) const override { return nullptr; }
-	std::unique_ptr<CMapHeader> loadMapHeader(const ui8 *, int, const std::string &, const std::string &, const std::string &) const override { return nullptr; }
-	void saveMap(const std::unique_ptr<CMap> &, boost::filesystem::path) const override {}
-
-private:
-	static constexpr int mapSize = 12;
-
-	static void placeHero(CMap & map, IGameInfoCallback * cb, const PlayerColor & owner, const HeroTypeID & type, const int3 & position)
-	{
-		auto handler = LIBRARY->objtypeh->getHandlerFor(Obj::HERO, type.toHeroType()->heroClass->getIndex());
-		auto hero = std::dynamic_pointer_cast<CGHeroInstance>(handler->create(cb, handler->getTemplates().front()));
-
-		hero->ID = Obj::HERO;
-		hero->setHeroType(type);
-		hero->tempOwner = owner;
-		hero->setAnchorPos(position + hero->getVisitableOffset());
-
-		map.getEditManager()->insertObject(hero);
-	}
-};
-
 void CreatureValueEstimator::startGame()
 {
-	logGlobal->info("Preparing a game to measure creatures in");
-
-	StartInfo startInfo;
-	startInfo.mode = EStartMode::NEW_GAME;
-	startInfo.difficulty = static_cast<ui8>(EMapDifficulty::EASY);
-	startInfo.mapname = "battleground";
-
-	for(int index = 0; index < 2; ++index)
-	{
-		PlayerSettings & settings = startInfo.playerInfos[PlayerColor(index)];
-		settings.color = PlayerColor(index);
-		settings.name = "Player";
-		settings.bonus = PlayerStartingBonus::GOLD; // no random starting artifact
-	}
-
-	mapService = std::make_unique<BattlegroundMapService>();
-
-	gameState = std::make_shared<CGameState>();
-	gameState->preInit(LIBRARY);
-
-	GameRandomizer randomizer(*gameState);
-	Load::ProgressAccumulator progressTracker;
-	gameState->init(mapService.get(), &startInfo, randomizer, progressTracker, false);
-
-	for(auto * hero : gameState->getMap().getObjects<CGHeroInstance>())
-	{
-		if(hero->getOwner() == PlayerColor(0) && attackerSideHero == nullptr)
-			attackerSideHero = hero;
-		if(hero->getOwner() == PlayerColor(1) && defenderSideHero == nullptr)
-			defenderSideHero = hero;
-	}
-
-	if(attackerSideHero == nullptr || defenderSideHero == nullptr)
-		throw std::runtime_error("Battleground map has no hero for one of its two players");
-
-	stripHeroBonuses(attackerSideHero);
-	stripHeroBonuses(defenderSideHero);
-}
-
-void CreatureValueEstimator::stripHeroBonuses(CGHeroInstance * hero)
-{
-	// starting army would join the battle next to the measured pair, carrying battle-wide bonuses
-	hero->clearSlots();
-
-	for(const auto & bonus : hero->getHeroType()->specialty)
-		hero->removeBonus(bonus);
-
-	for(int index = 0; index < LIBRARY->skillh->size(); ++index)
-		hero->setSecSkillLevel(SecondarySkill(index), 0, ChangeValueMode::ABSOLUTE);
-
-	for(auto skill : {PrimarySkill::ATTACK, PrimarySkill::DEFENSE, PrimarySkill::SPELL_POWER, PrimarySkill::KNOWLEDGE})
-		hero->setPrimarySkill(skill, 0, ChangeValueMode::ABSOLUTE);
+	game = std::make_unique<BattlegroundGame>();
+	gameState = game->gameState;
+	attackerSideHero = game->heroes[BattleSide::ATTACKER];
+	defenderSideHero = game->heroes[BattleSide::DEFENDER];
 }
 
 void CreatureValueEstimator::startBattle()
@@ -174,8 +58,7 @@ void CreatureValueEstimator::startBattle()
 	const auto terrain = gameState->getTile(tile)->getTerrainID();
 	const BattleLayout layout = BattleLayout::createDefaultLayout(*gameState, attackerSideHero, defenderSideHero);
 
-	// default battlefield is a clover field, whose luck bonus would skew measured damage
-	const BattleField battlefield(LIBRARY->identifiers()->getIdentifier(ModScope::scopeBuiltin(), "battlefield.sand_shore").value());
+	const BattleField battlefield = BattlegroundGame::neutralBattlefield();
 
 	BattleStart pack;
 	pack.info = BattleInfo::setupBattle(gameState.get(), tile, terrain, battlefield, armies, heroes, layout, nullptr);

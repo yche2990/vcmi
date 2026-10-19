@@ -399,10 +399,23 @@ void BattleProcessor::setBattleResult(const CBattleInfoCallback & battle, EBattl
 	const BattleID battleID = battle.getBattle()->getBattleID();
 
 	resultProcessor->setBattleResult(battle, resultType, victoriusSide);
-	resultProcessor->endBattle(battle);
+	if(resultInterceptor)
+		resultInterceptor(battleID, resultType, victoriusSide);
+	else
+		resultProcessor->endBattle(battle);
 
 	// No event dispatch is valid after battle removal.
 	actionsProcessor->forgetPendingDeaths(battleID);
+}
+
+void BattleProcessor::discardBattle(const BattleID & battleID)
+{
+	resultProcessor->battleCancelled(battleID);
+	actionsProcessor->forgetPendingDeaths(battleID);
+
+	BattleCancelled cancelled;
+	cancelled.battleID = battleID;
+	gameHandler->sendAndApply(cancelled);
 }
 
 bool BattleProcessor::makeAutomaticBattleAction(const CBattleInfoCallback & battle, const BattleAction &ba)

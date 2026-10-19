@@ -100,6 +100,12 @@ public:
 	/// Applies results of a battle once player agrees to them
 	void endBattleConfirm(const BattleID & battleID);
 
+	/// When set, receives the result of every battle that ends instead of the result being applied.
+	/// Such a battle stays in the game state until discardBattle removes it
+	std::function<void(const BattleID &, EBattleResult, BattleSide)> resultInterceptor;
+	/// Removes a battle without any consequence for either side, whether it has ended or not
+	void discardBattle(const BattleID & battleID);
+
 	template <typename Handler> void serialize(Handler &h)
 	{
 
