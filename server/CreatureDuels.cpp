@@ -17,6 +17,7 @@
 #include "battles/BattleProcessor.h"
 
 #include "../lib/CCreatureHandler.h"
+#include "../lib/CSkillHandler.h"
 #include "../lib/CStack.h"
 #include "../lib/GameLibrary.h"
 #include "../lib/battle/AutocombatPreferences.h"
@@ -29,7 +30,12 @@
 #include "../lib/callback/CBattleGameInterface.h"
 #include "../lib/callback/GameRandomizer.h"
 #include "../lib/callback/IClient.h"
+#include "../lib/entities/artifact/ArtifactUtils.h"
+#include "../lib/entities/artifact/CArtHandler.h"
+#include "../lib/entities/artifact/CArtifact.h"
+#include "../lib/entities/artifact/CArtifactInstance.h"
 #include "../lib/gameState/CGameState.h"
+#include "../lib/json/JsonNode.h"
 #include "../lib/mapObjects/CGHeroInstance.h"
 #include "../lib/mapObjects/army/CCommanderInstance.h"
 #include "../lib/mapObjects/army/CStackInstance.h"
@@ -61,9 +67,35 @@ constexpr int maxUnits = 100000;
 /// Share of health left above which a side counts as untouched by the battle
 constexpr double untouchedShare = 0.95;
 
-constexpr int maxRounds = 40;
-constexpr int maxActions = 1000;
-constexpr auto maxBattleDuration = std::chrono::seconds(180);
+/// Limits after which a battle counts as limited instead of won
+struct BattleLimits
+{
+	int rounds = 40;
+	int actions = 1000;
+	std::chrono::seconds duration = std::chrono::seconds(180);
+};
+
+/// One stack of an army, placed in the next free slot
+struct ArmyStack
+{
+	const CCreature * creature = nullptr;
+	int count = 0;
+};
+
+using Army = std::vector<ArmyStack>;
+
+/// Everything a hero brings to a battle besides its army. A side without a build gets a hero
+/// stripped of all of it
+struct HeroBuild
+{
+	int level = 1;
+	/// attack, defense, spell power, knowledge
+	std::array<int, 4> primary = {};
+	std::vector<std::pair<SecondarySkill, int>> skills;
+	/// war machines, as the artifacts a hero carries them as
+	std::vector<ArtifactID> warMachines;
+	bool spellbook = false;
+};
 
 /// Health of the units a side started a battle with, ignoring summoned units and clones
 struct SideHealth
@@ -137,10 +169,11 @@ bool isMeasurable(const CCreature * creature)
 class DuelServer final : public IGameServer, public IClient
 {
 public:
-	DuelServer(const std::string & battleAI, int experienceRank);
+	DuelServer(const std::string & battleAI, int experienceRank, bool heroSpells = false, BattleLimits limits = {});
 	~DuelServer();
 
 	BattleOutcome play(const CCreature * left, int leftCount, const CCreature * right, int rightCount, int seed);
+	BattleOutcome play(const Army & attacker, const HeroBuild * attackerHero, const Army & defender, const HeroBuild * defenderHero, int seed);
 
 	void setState(EServerState value) override { state = value; }
 	EServerState getState() const override { return state; }
@@ -157,6 +190,8 @@ private:
 	EServerState state = EServerState::GAMEPLAY;
 	int experienceRank;
 	std::string battleAI;
+	bool heroSpells;
+	BattleLimits limits;
 
 	std::unique_ptr<BattlegroundGame> game;
 	std::unique_ptr<CGameHandler> handler;
@@ -175,15 +210,19 @@ private:
 
 	void createInterfaces();
 	void removeBattleParticipants();
-	void setArmy(BattleSide side, const CCreature * creature, int count);
+	void removeArtifacts(CGHeroInstance * hero);
+	void prepareHero(BattleSide side, const HeroBuild * build);
+	void setArmy(BattleSide side, const Army & army);
 	void replaceBattleSetup(BattleStart & pack) const;
 	void onBattleStarted(const BattleID & battleID);
 	SideHealth healthOf(const BattleInfo & battle, BattleSide side) const;
 };
 
-DuelServer::DuelServer(const std::string & battleAI, int experienceRank)
+DuelServer::DuelServer(const std::string & battleAI, int experienceRank, bool heroSpells, BattleLimits limits)
 	: experienceRank(experienceRank)
 	, battleAI(battleAI)
+	, heroSpells(heroSpells)
+	, limits(limits)
 	, game(std::make_unique<BattlegroundGame>())
 	, handler(std::make_unique<CGameHandler>(*this, game->gameState))
 	// the game handler outlives every interface, so the environment does not own it
@@ -206,8 +245,8 @@ void DuelServer::createInterfaces()
 	callbacks = {};
 
 	AutocombatPreferences preferences;
-	// heroes are stripped of everything, and casting would be a contribution of the hero
-	preferences.enableSpellsUsage = false;
+	// casting is a contribution of the hero, so it is only allowed when heroes are measured
+	preferences.enableSpellsUsage = heroSpells;
 	preferences.enableTacticsUsage = false;
 
 	for(auto side : {BattleSide::ATTACKER, BattleSide::DEFENDER})
@@ -234,22 +273,27 @@ BattleSide DuelServer::sideOf(const PlayerColor & player)
 	return player == PlayerColor(0) ? BattleSide::ATTACKER : BattleSide::DEFENDER;
 }
 
+void DuelServer::removeArtifacts(CGHeroInstance * hero)
+{
+	// war machines and spellbook come as artifacts, and would join the battle or let the hero cast
+	std::vector<ArtifactPosition> worn;
+	for(const auto & [position, slot] : hero->artifactsWorn)
+		if(!slot.locked)
+			worn.push_back(position);
+
+	for(const auto & position : worn)
+		if(hero->getArt(position))
+			game->gameState->getMap().removeArtifactInstance(*hero, position);
+
+	while(!hero->artifactsInBackpack.empty())
+		game->gameState->getMap().removeArtifactInstance(*hero, ArtifactPosition::BACKPACK_START);
+}
+
 void DuelServer::removeBattleParticipants()
 {
 	for(auto * hero : game->heroes)
 	{
-		// war machines and spellbook come as artifacts, and would join the battle or let the hero cast
-		std::vector<ArtifactPosition> worn;
-		for(const auto & [position, slot] : hero->artifactsWorn)
-			if(!slot.locked)
-				worn.push_back(position);
-
-		for(const auto & position : worn)
-			if(hero->getArt(position))
-				game->gameState->getMap().removeArtifactInstance(*hero, position);
-
-		while(!hero->artifactsInBackpack.empty())
-			game->gameState->getMap().removeArtifactInstance(*hero, ArtifactPosition::BACKPACK_START);
+		removeArtifacts(hero);
 
 		if(auto * commander = hero->getCommander())
 			commander->setAlive(false);
@@ -258,27 +302,87 @@ void DuelServer::removeBattleParticipants()
 	}
 }
 
-void DuelServer::setArmy(BattleSide side, const CCreature * creature, int count)
+void DuelServer::prepareHero(BattleSide side, const HeroBuild * build)
+{
+	CGHeroInstance * hero = game->heroes[side];
+	auto & map = game->gameState->getMap();
+
+	if(!build && hero->secSkills.empty() && hero->level == 1 && hero->artifactsWorn.empty())
+		return; // already stripped, which is what every creature duel has
+
+	removeArtifacts(hero);
+
+	for(size_t index = 0; index < LIBRARY->skillh->size(); ++index)
+		if(hero->getSecSkillLevel(SecondarySkill(static_cast<int32_t>(index))) > 0)
+			hero->setSecSkillLevel(SecondarySkill(static_cast<int32_t>(index)), 0, ChangeValueMode::ABSOLUTE);
+
+	const std::array<PrimarySkill, 4> primarySkills = {PrimarySkill::ATTACK, PrimarySkill::DEFENSE, PrimarySkill::SPELL_POWER, PrimarySkill::KNOWLEDGE};
+	for(size_t index = 0; index < primarySkills.size(); ++index)
+		hero->setPrimarySkill(primarySkills[index], build ? build->primary[index] : 0, ChangeValueMode::ABSOLUTE);
+
+	hero->level = build ? std::max(1, build->level) : 1;
+
+	if(build)
+	{
+		for(const auto & [skill, level] : build->skills)
+			hero->setSecSkillLevel(skill, std::clamp(level, 1, 3), ChangeValueMode::ABSOLUTE);
+
+		std::vector<ArtifactID> artifacts = build->warMachines;
+		if(build->spellbook)
+			artifacts.push_back(ArtifactID(ArtifactID::SPELLBOOK));
+
+		for(const auto & artifact : artifacts)
+		{
+			const auto position = ArtifactUtils::getArtEquippedPosition(hero, artifact);
+			if(position == ArtifactPosition::PRE_FIRST)
+			{
+				logGlobal->warn("Creature duels: hero has no free slot for artifact %s", artifact.toArtifact()->getJsonKey());
+				continue;
+			}
+			auto * instance = game->gameState->createArtifact(artifact);
+			map.putArtifactInstance(*hero, instance->getId(), position);
+		}
+	}
+
+	hero->mana = build ? hero->manaLimit() : 0;
+}
+
+void DuelServer::setArmy(BattleSide side, const Army & army)
 {
 	CGHeroInstance * hero = game->heroes[side];
 	hero->clearSlots();
 
-	auto stack = std::make_unique<CStackInstance>(game->gameState.get(), creature->getId(), count);
+	if(army.size() > GameConstants::ARMY_SIZE)
+		throw std::runtime_error("Army has more stacks than a hero can lead");
 
-	if(experienceRank > 0)
+	for(size_t index = 0; index < army.size(); ++index)
 	{
-		const auto & ranks = LIBRARY->creh->expRanks.at(vstd::iswithin(creature->getLevel(), 1, 7) ? creature->getLevel() : 0);
-		const int rank = std::clamp<int>(experienceRank, 1, static_cast<int>(ranks.size()) - 1);
-		stack->giveTotalStackExperience(static_cast<TExpType>(ranks.at(rank - 1)) * count);
-	}
+		const CCreature * creature = army[index].creature;
+		const int count = army[index].count;
+		auto stack = std::make_unique<CStackInstance>(game->gameState.get(), creature->getId(), count);
 
-	hero->putStack(SlotID(0), std::move(stack));
+		if(experienceRank > 0)
+		{
+			const auto & ranks = LIBRARY->creh->expRanks.at(vstd::iswithin(creature->getLevel(), 1, 7) ? creature->getLevel() : 0);
+			const int rank = std::clamp<int>(experienceRank, 1, static_cast<int>(ranks.size()) - 1);
+			stack->giveTotalStackExperience(static_cast<TExpType>(ranks.at(rank - 1)) * count);
+		}
+
+		hero->putStack(SlotID(static_cast<int32_t>(index)), std::move(stack));
+	}
 }
 
 BattleOutcome DuelServer::play(const CCreature * left, int leftCount, const CCreature * right, int rightCount, int seed)
 {
-	setArmy(BattleSide::ATTACKER, left, leftCount);
-	setArmy(BattleSide::DEFENDER, right, rightCount);
+	return play({{left, leftCount}}, nullptr, {{right, rightCount}}, nullptr, seed);
+}
+
+BattleOutcome DuelServer::play(const Army & attackerArmy, const HeroBuild * attackerHero, const Army & defenderArmy, const HeroBuild * defenderHero, int seed)
+{
+	prepareHero(BattleSide::ATTACKER, attackerHero);
+	prepareHero(BattleSide::DEFENDER, defenderHero);
+	setArmy(BattleSide::ATTACKER, attackerArmy);
+	setArmy(BattleSide::DEFENDER, defenderArmy);
 
 	pending.clear();
 	currentAction.reset();
@@ -304,7 +408,7 @@ BattleOutcome DuelServer::play(const CCreature * left, int leftCount, const CCre
 
 	while(!battleEnded)
 	{
-		if(battle->getRound() > maxRounds || actions > maxActions || std::chrono::steady_clock::now() - startTime > maxBattleDuration)
+		if(battle->getRound() > limits.rounds || actions > limits.actions || std::chrono::steady_clock::now() - startTime > limits.duration)
 		{
 			outcome.limited = true;
 			break;
@@ -364,7 +468,8 @@ SideHealth DuelServer::healthOf(const BattleInfo & battle, BattleSide side) cons
 
 	for(const auto & stack : battle.stacks)
 	{
-		if(stack->unitSide() != side || stack->summoned || stack->isClone())
+		// war machines are not part of the army that is measured
+		if(stack->unitSide() != side || stack->summoned || stack->isClone() || stack->unitSlot() == SlotID::WAR_MACHINES_SLOT)
 			continue;
 
 		result.initial += static_cast<int64_t>(stack->unitBaseAmount()) * stack->getMaxHealth();
@@ -498,6 +603,106 @@ struct JobResult
 	std::string status = "ok";
 };
 
+/// Searches the size of the reference side that the subject side is even against. Each battle
+/// is played by `play`, which fields the reference side at the guessed size and returns the size
+/// it actually fielded, as fielding only whole units rounds the guess
+struct SearchSettings
+{
+	double start = 1;
+	double lowest = 1;
+	double highest = 1;
+	uint32_t seedBase = 0;
+};
+
+using PlayAtSize = std::function<BattleOutcome(double guess, bool subjectAttacks, int seed, double & fielded)>;
+
+JobResult searchEquilibrium(const SearchSettings & settings, const PlayAtSize & play)
+{
+	JobResult result;
+
+	double guess = std::clamp(settings.start, settings.lowest, settings.highest);
+	std::vector<double> previousStep;
+	std::vector<double> lastStep;
+
+	for(int step = 0; step < maxSteps; ++step)
+	{
+		std::vector<double> estimates;
+		double fielded = guess;
+
+		for(int index = 0; index < battlesPerStep; ++index)
+		{
+			// the subject alternates between sides, so that neither side's advantage stays with it
+			const bool subjectAttacks = (result.battles % 2) == 0;
+			const int seed = static_cast<int>(settings.seedBase + result.battles);
+			++result.battles;
+
+			const BattleOutcome outcome = play(guess, subjectAttacks, seed, fielded);
+
+			const SideHealth & subjectHealth = outcome.health[subjectAttacks ? BattleSide::ATTACKER : BattleSide::DEFENDER];
+			const SideHealth & referenceHealth = outcome.health[subjectAttacks ? BattleSide::DEFENDER : BattleSide::ATTACKER];
+
+			if(outcome.limited)
+				++result.limited;
+			result.rejected += outcome.rejected;
+
+			const double subjectLeft = std::min(subjectHealth.shareLeft(), untouchedShare);
+			const double referenceLeft = std::min(referenceHealth.shareLeft(), untouchedShare);
+
+			if(subjectHealth.shareLeft() >= untouchedShare && referenceHealth.shareLeft() >= untouchedShare)
+				continue;
+
+			// Lanchester's square law: strength of a side grows with the square of its numbers, and
+			// what both sides lose of it is equal, so the health left gives the ratio of strengths
+			const double strengthRatio = (1.0 - referenceLeft * referenceLeft) / (1.0 - subjectLeft * subjectLeft);
+			estimates.push_back(std::log(fielded) + 0.5 * std::log(strengthRatio));
+			++result.valid;
+		}
+
+		result.steps = step + 1;
+
+		if(estimates.empty())
+		{
+			result.status = "stalemate";
+			break;
+		}
+
+		previousStep = std::move(lastStep);
+		lastStep = estimates;
+
+		const double mean = std::accumulate(estimates.begin(), estimates.end(), 0.0) / estimates.size();
+		double next = std::exp(mean);
+		next = std::clamp(next, fielded / maxStepFactor, fielded * maxStepFactor);
+
+		if(next < settings.lowest || next > settings.highest)
+		{
+			result.status = "out-of-range";
+			next = std::clamp(next, settings.lowest, settings.highest);
+		}
+
+		const bool converged = std::max(next / fielded, fielded / next) < convergedStep;
+		guess = next;
+
+		if(converged && step > 0)
+			break;
+	}
+
+	std::vector<double> combined = lastStep;
+	vstd::concatenate(combined, previousStep);
+
+	if(!combined.empty())
+	{
+		const double mean = std::accumulate(combined.begin(), combined.end(), 0.0) / combined.size();
+		double variance = 0;
+		for(double value : combined)
+			variance += (value - mean) * (value - mean);
+
+		result.equilibriumUnits = std::exp(mean);
+		result.spread = combined.size() > 1 ? std::sqrt(variance / (combined.size() - 1)) : 0.0;
+	}
+
+	return result;
+}
+
 class DuelRunner
 {
 public:
@@ -617,100 +822,29 @@ void DuelRunner::recoverCrashedJob()
 
 JobResult DuelRunner::measure(const Job & job)
 {
-	JobResult result;
-
 	const double subjectValue = configuredValue(job.subject);
 	const double referenceValue = configuredValue(job.reference);
 
-	result.subjectUnits = std::clamp(static_cast<int>(std::lround(armyBudget / subjectValue)), minSubjectUnits, maxUnits);
-	result.startingUnits = result.subjectUnits * subjectValue / referenceValue;
+	const int subjectUnits = std::clamp(static_cast<int>(std::lround(armyBudget / subjectValue)), minSubjectUnits, maxUnits);
+	const double startingUnits = subjectUnits * subjectValue / referenceValue;
 
-	const double lowest = std::max(1.0, result.startingUnits / maxPriorFactor);
-	const double highest = std::min<double>(maxUnits, result.startingUnits * maxPriorFactor);
-	const uint32_t seedBase = stableHash(job.key(options.experienceRank));
+	SearchSettings settings;
+	settings.start = startingUnits;
+	settings.lowest = std::max(1.0, startingUnits / maxPriorFactor);
+	settings.highest = std::min<double>(maxUnits, startingUnits * maxPriorFactor);
+	settings.seedBase = stableHash(job.key(options.experienceRank));
 
-	double guess = std::clamp(result.startingUnits, lowest, highest);
-	std::vector<double> previousStep;
-	std::vector<double> lastStep;
-
-	for(int step = 0; step < maxSteps; ++step)
+	JobResult result = searchEquilibrium(settings, [&](double guess, bool subjectAttacks, int seed, double & fielded)
 	{
 		const int referenceUnits = std::max(1, static_cast<int>(std::lround(guess)));
-		std::vector<double> estimates;
+		fielded = referenceUnits;
+		return subjectAttacks
+			? server->play(job.subject, subjectUnits, job.reference, referenceUnits, seed)
+			: server->play(job.reference, referenceUnits, job.subject, subjectUnits, seed);
+	});
 
-		for(int index = 0; index < battlesPerStep; ++index)
-		{
-			// the measured creature alternates between sides, so that neither side's advantage stays with it
-			const bool subjectAttacks = (result.battles % 2) == 0;
-			const int seed = static_cast<int>(seedBase + result.battles);
-			++result.battles;
-
-			const BattleOutcome outcome = subjectAttacks
-				? server->play(job.subject, result.subjectUnits, job.reference, referenceUnits, seed)
-				: server->play(job.reference, referenceUnits, job.subject, result.subjectUnits, seed);
-
-			const SideHealth & subjectHealth = outcome.health[subjectAttacks ? BattleSide::ATTACKER : BattleSide::DEFENDER];
-			const SideHealth & referenceHealth = outcome.health[subjectAttacks ? BattleSide::DEFENDER : BattleSide::ATTACKER];
-
-			if(outcome.limited)
-				++result.limited;
-			result.rejected += outcome.rejected;
-
-			const double subjectLeft = std::min(subjectHealth.shareLeft(), untouchedShare);
-			const double referenceLeft = std::min(referenceHealth.shareLeft(), untouchedShare);
-
-			if(subjectHealth.shareLeft() >= untouchedShare && referenceHealth.shareLeft() >= untouchedShare)
-				continue;
-
-			// Lanchester's square law: strength of a side grows with the square of its numbers, and
-			// what both sides lose of it is equal, so the health left gives the ratio of strengths
-			const double strengthRatio = (1.0 - referenceLeft * referenceLeft) / (1.0 - subjectLeft * subjectLeft);
-			estimates.push_back(std::log(referenceUnits) + 0.5 * std::log(strengthRatio));
-			++result.valid;
-		}
-
-		result.steps = step + 1;
-
-		if(estimates.empty())
-		{
-			result.status = "stalemate";
-			break;
-		}
-
-		previousStep = std::move(lastStep);
-		lastStep = estimates;
-
-		const double mean = std::accumulate(estimates.begin(), estimates.end(), 0.0) / estimates.size();
-		double next = std::exp(mean);
-		next = std::clamp(next, referenceUnits / maxStepFactor, referenceUnits * maxStepFactor);
-
-		if(next < lowest || next > highest)
-		{
-			result.status = "out-of-range";
-			next = std::clamp(next, lowest, highest);
-		}
-
-		const bool converged = std::max(next / referenceUnits, referenceUnits / next) < convergedStep;
-		guess = next;
-
-		if(converged && step > 0)
-			break;
-	}
-
-	std::vector<double> combined = lastStep;
-	vstd::concatenate(combined, previousStep);
-
-	if(!combined.empty())
-	{
-		const double mean = std::accumulate(combined.begin(), combined.end(), 0.0) / combined.size();
-		double variance = 0;
-		for(double value : combined)
-			variance += (value - mean) * (value - mean);
-
-		result.equilibriumUnits = std::exp(mean);
-		result.spread = combined.size() > 1 ? std::sqrt(variance / (combined.size() - 1)) : 0.0;
-	}
-
+	result.subjectUnits = subjectUnits;
+	result.startingUnits = startingUnits;
 	return result;
 }
 
@@ -809,12 +943,313 @@ void DuelRunner::run()
 	logGlobal->info("Creature duels complete");
 }
 
+/// One hero build of one faction, measured with the faction's army against the same army led by
+/// a stripped hero
+struct FactionJob
+{
+	std::string faction;
+	std::string name;
+	Army army;
+	HeroBuild build;
+	std::string error;
+
+	std::string key() const
+	{
+		return faction + "," + name;
+	}
+};
+
+class FactionRunner
+{
+public:
+	explicit FactionRunner(const CreatureDuels::Options & options);
+	void run();
+
+private:
+	const CreatureDuels::Options & options;
+	std::unique_ptr<DuelServer> server;
+
+	std::vector<FactionJob> jobs;
+	std::set<std::string> done;
+
+	static DuelServer * createServer(const CreatureDuels::Options & options);
+	boost::filesystem::path markerPath() const;
+	void collectJobs();
+	void loadDone();
+	void recoverCrashedJob();
+	JobResult measure(const FactionJob & job);
+	void writeResult(const FactionJob & job, const JobResult & result, double seconds);
+};
+
+FactionRunner::FactionRunner(const CreatureDuels::Options & options)
+	: options(options)
+{
+}
+
+DuelServer * FactionRunner::createServer(const CreatureDuels::Options & options)
+{
+	BattleLimits limits;
+	limits.actions = 4000;
+	limits.duration = std::chrono::seconds(300);
+	return new DuelServer(options.battleAI, 0, true, limits);
+}
+
+boost::filesystem::path FactionRunner::markerPath() const
+{
+	return boost::filesystem::path(options.output.string() + ".current");
+}
+
+void FactionRunner::collectJobs()
+{
+	std::ifstream file(options.factionBuilds.c_str(), std::ios::binary);
+	if(!file)
+		throw std::runtime_error("Unable to open faction hero builds " + options.factionBuilds.string());
+	const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+	const JsonNode root(reinterpret_cast<const std::byte *>(text.data()), text.size(), options.factionBuilds.string());
+
+	std::map<std::string, const CCreature *> creatures;
+	for(const auto & creature : LIBRARY->creh->objects)
+		if(creature)
+			creatures[creature->getJsonKey()] = creature.get();
+
+	std::map<std::string, ArtifactID> artifacts;
+	for(const auto & artifact : LIBRARY->arth->objects)
+		if(artifact)
+			artifacts[artifact->getJsonKey()] = artifact->getId();
+
+	std::map<std::string, SecondarySkill> skills;
+	for(size_t index = 0; index < LIBRARY->skillh->size(); ++index)
+	{
+		const SecondarySkill skill(static_cast<int32_t>(index));
+		skills[skill.toSkill()->getJsonKey()] = skill;
+	}
+
+	int jobIndex = 0;
+	for(const auto & factionNode : root["factions"].Vector())
+	{
+		Army army;
+		std::string armyError;
+		for(const auto & stackNode : factionNode["army"].Vector())
+		{
+			const auto found = creatures.find(stackNode[0].String());
+			if(found == creatures.end())
+				armyError += "unknown creature " + stackNode[0].String() + "; ";
+			else
+				army.push_back({found->second, static_cast<int>(stackNode[1].Integer())});
+		}
+
+		for(const auto & buildNode : factionNode["builds"].Vector())
+		{
+			if(jobIndex++ % options.shardCount != options.shardIndex)
+				continue;
+
+			FactionJob job;
+			job.faction = factionNode["faction"].String();
+			job.name = buildNode["name"].String();
+			job.army = army;
+			job.error = armyError;
+
+			job.build.level = static_cast<int>(buildNode["level"].Integer());
+			for(size_t index = 0; index < job.build.primary.size(); ++index)
+				job.build.primary[index] = static_cast<int>(buildNode["primary"][index].Integer());
+			for(const auto & skillNode : buildNode["skills"].Vector())
+			{
+				const auto found = skills.find(skillNode[0].String());
+				if(found == skills.end())
+					job.error += "unknown skill " + skillNode[0].String() + "; ";
+				else
+					job.build.skills.emplace_back(found->second, static_cast<int>(skillNode[1].Integer()));
+			}
+			for(const auto & machineNode : buildNode["warMachines"].Vector())
+			{
+				const auto found = artifacts.find(machineNode.String());
+				if(found == artifacts.end())
+					job.error += "unknown war machine " + machineNode.String() + "; ";
+				else
+					job.build.warMachines.push_back(found->second);
+			}
+			job.build.spellbook = buildNode["spellbook"].Bool();
+
+			if(army.empty())
+				job.error += "empty army; ";
+			jobs.push_back(std::move(job));
+		}
+	}
+}
+
+void FactionRunner::loadDone()
+{
+	std::ifstream file(options.output.c_str());
+	std::string line;
+	while(std::getline(file, line))
+	{
+		std::vector<std::string> fields;
+		boost::split(fields, line, boost::is_any_of(","));
+		if(fields.size() > 2)
+			done.insert(fields[0] + "," + fields[1]);
+	}
+}
+
+void FactionRunner::recoverCrashedJob()
+{
+	std::ifstream marker(markerPath().c_str());
+	std::string key;
+	if(!std::getline(marker, key) || key.empty() || done.count(key))
+		return;
+
+	for(const auto & job : jobs)
+	{
+		if(job.key() != key)
+			continue;
+
+		JobResult result;
+		result.status = "crashed";
+		writeResult(job, result, 0);
+		done.insert(key);
+		logGlobal->warn("Faction heroes: %s crashed the previous run and is skipped", key);
+	}
+}
+
+JobResult FactionRunner::measure(const FactionJob & job)
+{
+	double armyValue = 0;
+	for(const auto & stack : job.army)
+		armyValue += configuredValue(stack.creature) * stack.count;
+
+	SearchSettings settings;
+	settings.start = 1.0;
+	settings.lowest = 1.0 / maxStepFactor;
+	settings.highest = maxStepFactor;
+	settings.seedBase = stableHash(job.key());
+
+	// the reference side is the same army scaled, led by a stripped hero, so that the scale it is
+	// even at is what the hero is worth, as a factor on the army
+	return searchEquilibrium(settings, [&](double guess, bool subjectAttacks, int seed, double & fielded)
+	{
+		Army scaled;
+		double scaledValue = 0;
+		for(const auto & stack : job.army)
+		{
+			const int count = std::max(1, static_cast<int>(std::lround(stack.count * guess)));
+			scaled.push_back({stack.creature, count});
+			scaledValue += configuredValue(stack.creature) * count;
+		}
+		fielded = scaledValue / armyValue;
+
+		return subjectAttacks
+			? server->play(job.army, &job.build, scaled, nullptr, seed)
+			: server->play(scaled, nullptr, job.army, &job.build, seed);
+	});
+}
+
+void FactionRunner::writeResult(const FactionJob & job, const JobResult & result, double seconds)
+{
+	const bool newFile = !boost::filesystem::exists(options.output);
+	std::ofstream file(options.output.c_str(), std::ios::app);
+
+	if(newFile)
+		file << "faction,build,level,equilibriumScale,spread,battles,valid,limited,rejected,steps,seconds,status\n";
+
+	file << boost::str(boost::format("%s,%d,%.4f,%.4f,%d,%d,%d,%d,%d,%.1f,%s\n")
+		% job.key()
+		% job.build.level
+		% result.equilibriumUnits
+		% result.spread
+		% result.battles
+		% result.valid
+		% result.limited
+		% result.rejected
+		% result.steps
+		% seconds
+		% result.status);
+}
+
+void FactionRunner::run()
+{
+	collectJobs();
+	loadDone();
+	recoverCrashedJob();
+
+	const size_t remaining = std::count_if(jobs.begin(), jobs.end(), [this](const FactionJob & job) { return !done.count(job.key()); });
+
+	{
+		std::ofstream total(boost::filesystem::path(options.output.string() + ".jobs").c_str());
+		total << jobs.size() << "\n";
+	}
+
+	logGlobal->info("Faction heroes: shard %d of %d, %d builds, %d still to measure",
+		options.shardIndex + 1, options.shardCount, static_cast<int>(jobs.size()), static_cast<int>(remaining));
+
+	server.reset(createServer(options));
+
+	const auto startTime = std::chrono::steady_clock::now();
+	size_t measured = 0;
+
+	for(const auto & job : jobs)
+	{
+		const std::string key = job.key();
+		if(done.count(key))
+			continue;
+
+		{
+			std::ofstream marker(markerPath().c_str());
+			marker << key << "\n";
+		}
+
+		const auto jobStart = std::chrono::steady_clock::now();
+		JobResult result;
+
+		if(!job.error.empty())
+		{
+			result.status = "error: " + job.error;
+			boost::replace_all(result.status, ",", ";");
+			logGlobal->error("Faction heroes: %s skipped: %s", key, job.error);
+		}
+		else
+		{
+			try
+			{
+				result = measure(job);
+			}
+			catch(const std::exception & e)
+			{
+				result.status = std::string("error: ") + e.what();
+				boost::replace_all(result.status, ",", ";");
+				boost::replace_all(result.status, "\n", " ");
+				logGlobal->error("Faction heroes: %s failed: %s", key, e.what());
+
+				server.reset();
+				server.reset(createServer(options));
+			}
+		}
+
+		const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - jobStart).count();
+		writeResult(job, result, seconds);
+		done.insert(key);
+		++measured;
+
+		const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
+		const double eta = elapsed / measured * (remaining - measured);
+		logGlobal->info("Faction heroes: %d/%d %s - %s, %.0f s left", static_cast<int>(measured), static_cast<int>(remaining), key, result.status, eta);
+	}
+
+	boost::filesystem::remove(markerPath());
+	logGlobal->info("Faction heroes complete");
+}
+
 }
 
 void CreatureDuels::run(const Options & options)
 {
 	if(options.shardCount < 1 || options.shardIndex < 0 || options.shardIndex >= options.shardCount)
 		throw std::runtime_error("Invalid creature duels shard");
+
+	if(!options.factionBuilds.empty())
+	{
+		FactionRunner runner(options);
+		runner.run();
+		return;
+	}
 
 	DuelRunner runner(options);
 	runner.run();

@@ -31,6 +31,10 @@ public:
 		std::string battleAI = "BattleAI";
 		/// Optional file with creature identifiers, one per line, to measure only those
 		boost::filesystem::path subjects;
+		/// When set, measures hero builds of factions instead of creatures: each build leads its
+		/// faction's army against the same army led by a stripped hero, and the scale that army is
+		/// even at is written for each build. File with the factions, their armies and builds, as JSON
+		boost::filesystem::path factionBuilds;
 	};
 
 	static void run(const Options & options);
