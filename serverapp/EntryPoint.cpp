@@ -256,6 +256,9 @@ static void handleCommandOptions(int argc, const char * argv[], boost::program_o
 	("creature-duels-references", boost::program_options::value<int>(), "Number of original game creatures each creature is measured against, 4 by default")
 	("creature-duels-ai", boost::program_options::value<std::string>(), "Battle AI controlling both sides of creature duels, BattleAI by default")
 	("creature-duels-subjects", boost::program_options::value<std::string>(), "File with identifiers of creatures to measure in creature duels, one per line, all creatures by default")
+	("faction-heroes", boost::program_options::value<std::string>(), "Measure hero builds of factions: each build leads its faction's army against the same army led by a stripped hero, results are appended to given CSV file")
+	("faction-heroes-builds", boost::program_options::value<std::string>(), "JSON file with factions, their armies and the hero builds to measure")
+	("faction-heroes-shard", boost::program_options::value<std::string>(), "Part of builds to measure in this process, as index/count with index starting at 1, e.g. 2/4")
 	("translate-mod", boost::program_options::value<std::string>(), "Export translations for specified mod")
 	("export-lua-docs", boost::program_options::value<std::string>(), "Export Lua scripting API documentation to specified directory")
 	("port", boost::program_options::value<ui16>(), "port at which server will listen to connections from client")
@@ -327,25 +330,28 @@ static std::pair<int, int> parseShard(const std::string & text)
 /// Several processes measuring creature duels at once would otherwise all write to the same log
 static std::string serverLogName(int argc, const char * argv[])
 {
-	bool duels = false;
+	std::string mode;
 	std::string shard;
 	for(int index = 1; index < argc; ++index)
 	{
 		const std::string argument = argv[index];
-		if(argument == "--creature-duels" || argument.starts_with("--creature-duels="))
-			duels = true;
-		if(argument == "--creature-duels-shard" && index + 1 < argc)
-			shard = argv[index + 1];
-		if(argument.starts_with("--creature-duels-shard="))
-			shard = argument.substr(std::string("--creature-duels-shard=").size());
+		for(const std::string option : {"creature-duels", "faction-heroes"})
+		{
+			if(argument == "--" + option || argument.starts_with("--" + option + "="))
+				mode = option == "creature-duels" ? "duels" : "factions";
+			if(argument == "--" + option + "-shard" && index + 1 < argc)
+				shard = argv[index + 1];
+			if(argument.starts_with("--" + option + "-shard="))
+				shard = argument.substr(("--" + option + "-shard=").size());
+		}
 	}
 
-	if(!duels)
+	if(mode.empty())
 		return "VCMI_Server_log.txt";
 
 	boost::replace_all(shard, "/", "-");
 	shard.erase(std::remove_if(shard.begin(), shard.end(), [](char symbol){ return (symbol < '0' || symbol > '9') && symbol != '-'; }), shard.end());
-	return shard.empty() ? "VCMI_Server_duels_log.txt" : "VCMI_Server_duels_" + shard + "_log.txt";
+	return shard.empty() ? "VCMI_Server_" + mode + "_log.txt" : "VCMI_Server_" + mode + "_" + shard + "_log.txt";
 }
 
 /// Every battle AI decision is logged at trace level, which would slow duels down many times, and
@@ -359,6 +365,21 @@ static void limitLogLevel(ELogLevel::ELogLevel lowest)
 		if(logger->getLevel() < lowest)
 			logger->setLevel(lowest);
 	}
+}
+
+static void runFactionHeroes(const boost::program_options::variables_map & opts)
+{
+	CreatureDuels::Options options;
+	options.output = opts["faction-heroes"].as<std::string>();
+	if(!opts.count("faction-heroes-builds"))
+		throw std::runtime_error("Faction heroes need --faction-heroes-builds");
+	options.factionBuilds = opts["faction-heroes-builds"].as<std::string>();
+	if(opts.count("faction-heroes-shard"))
+		std::tie(options.shardIndex, options.shardCount) = parseShard(opts["faction-heroes-shard"].as<std::string>());
+	if(opts.count("creature-duels-ai"))
+		options.battleAI = opts["creature-duels-ai"].as<std::string>();
+
+	CreatureDuels::run(options);
 }
 
 static void runCreatureDuels(const boost::program_options::variables_map & opts)
@@ -395,12 +416,16 @@ int main(int argc, const char * argv[])
 	LIBRARY->initializeFilesystem(false);
 	logConfigurator.configure();
 
-	if(opts.count("creature-duels"))
+	if(opts.count("creature-duels") || opts.count("faction-heroes"))
 		limitLogLevel(ELogLevel::INFO);
 
 	LIBRARY->initializeLibrary();
 
-	if(opts.count("creature-duels"))
+	if(opts.count("faction-heroes"))
+	{
+		runFactionHeroes(opts);
+	}
+	else if(opts.count("creature-duels"))
 	{
 		runCreatureDuels(opts);
 	}
