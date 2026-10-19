@@ -13,9 +13,11 @@
 
 #include "../server/CVCMIServer.h"
 #include "../server/CreatureValueEstimator.h"
+#include "../server/CreatureDuels.h"
 
 #include "../lib/CConsoleHandler.h"
 #include "../lib/logging/CBasicLogConfigurator.h"
+#include "../lib/logging/CLogger.h"
 #include "../lib/VCMIDirs.h"
 #include "../lib/GameLibrary.h"
 #include "../lib/CConfigHandler.h"
@@ -248,6 +250,12 @@ static void handleCommandOptions(int argc, const char * argv[], boost::program_o
 	("dummy-run", "Shutdown immediately after loading was sucessful")
 	("creature-values", "Compute AI values and fight values of all creatures and compare them against configured values")
 	("creature-values-rank", boost::program_options::value<int>(), "Same as creature-values, with every measured stack at given stack experience rank")
+	("creature-duels", boost::program_options::value<std::string>(), "Measure all creatures in complete battles against creatures of the original game, with battle AI on both sides, appending results to given CSV file")
+	("creature-duels-rank", boost::program_options::value<int>(), "Stack experience rank of all units in creature duels, 0 by default")
+	("creature-duels-shard", boost::program_options::value<std::string>(), "Part of creatures to measure in this process, as index/count with index starting at 1, e.g. 2/4")
+	("creature-duels-references", boost::program_options::value<int>(), "Number of original game creatures each creature is measured against, 4 by default")
+	("creature-duels-ai", boost::program_options::value<std::string>(), "Battle AI controlling both sides of creature duels, BattleAI by default")
+	("creature-duels-subjects", boost::program_options::value<std::string>(), "File with identifiers of creatures to measure in creature duels, one per line, all creatures by default")
 	("translate-mod", boost::program_options::value<std::string>(), "Export translations for specified mod")
 	("export-lua-docs", boost::program_options::value<std::string>(), "Export Lua scripting API documentation to specified directory")
 	("port", boost::program_options::value<ui16>(), "port at which server will listen to connections from client")
@@ -301,13 +309,79 @@ static void handleCommandOptions(int argc, const char * argv[], boost::program_o
 	}
 }
 
+static std::pair<int, int> parseShard(const std::string & text)
+{
+	std::vector<std::string> parts;
+	boost::split(parts, text, boost::is_any_of("/"));
+	if(parts.size() != 2)
+		throw std::runtime_error("Creature duels shard must be given as index/count, e.g. 2/4");
+
+	const int index = std::stoi(parts[0]);
+	const int count = std::stoi(parts[1]);
+	if(count < 1 || index < 1 || index > count)
+		throw std::runtime_error("Creature duels shard index must be between 1 and count");
+
+	return {index - 1, count};
+}
+
+/// Several processes measuring creature duels at once would otherwise all write to the same log
+static std::string serverLogName(int argc, const char * argv[])
+{
+	bool duels = false;
+	std::string shard;
+	for(int index = 1; index < argc; ++index)
+	{
+		const std::string argument = argv[index];
+		if(argument == "--creature-duels" || argument.starts_with("--creature-duels="))
+			duels = true;
+		if(argument == "--creature-duels-shard" && index + 1 < argc)
+			shard = argv[index + 1];
+		if(argument.starts_with("--creature-duels-shard="))
+			shard = argument.substr(std::string("--creature-duels-shard=").size());
+	}
+
+	if(!duels)
+		return "VCMI_Server_log.txt";
+
+	boost::replace_all(shard, "/", "-");
+	shard.erase(std::remove_if(shard.begin(), shard.end(), [](char symbol){ return !std::isdigit(static_cast<unsigned char>(symbol)) && symbol != '-'; }), shard.end());
+	return shard.empty() ? "VCMI_Server_duels_log.txt" : "VCMI_Server_duels_" + shard + "_log.txt";
+}
+
+static void runCreatureDuels(const boost::program_options::variables_map & opts)
+{
+	// every battle AI decision is logged at trace level, which would slow duels down many times
+	CLogger::getGlobalLogger()->setLevel(ELogLevel::INFO);
+	for(const auto & loggerNode : settings["logging"]["loggers"].Vector())
+	{
+		CLogger * logger = CLogger::getLogger(CLoggerDomain(loggerNode["domain"].String()));
+		if(logger->getLevel() < ELogLevel::INFO)
+			logger->setLevel(ELogLevel::INFO);
+	}
+
+	CreatureDuels::Options options;
+	options.output = opts["creature-duels"].as<std::string>();
+	if(opts.count("creature-duels-rank"))
+		options.experienceRank = opts["creature-duels-rank"].as<int>();
+	if(opts.count("creature-duels-shard"))
+		std::tie(options.shardIndex, options.shardCount) = parseShard(opts["creature-duels-shard"].as<std::string>());
+	if(opts.count("creature-duels-references"))
+		options.references = std::max(1, opts["creature-duels-references"].as<int>());
+	if(opts.count("creature-duels-ai"))
+		options.battleAI = opts["creature-duels-ai"].as<std::string>();
+	if(opts.count("creature-duels-subjects"))
+		options.subjects = opts["creature-duels-subjects"].as<std::string>();
+
+	CreatureDuels::run(options);
+}
+
 int main(int argc, const char * argv[])
 {
 	// Correct working dir executable folder (not bundle folder) so we can use executable relative paths
 	boost::filesystem::current_path(boost::filesystem::system_complete(argv[0]).parent_path());
 
 	CConsoleHandler console;
-	CBasicLogConfigurator logConfigurator(VCMIDirs::get().userLogsPath() / "VCMI_Server_log.txt", &console);
+	CBasicLogConfigurator logConfigurator(VCMIDirs::get().userLogsPath() / serverLogName(argc, argv), &console);
 	logConfigurator.configureDefault();
 	logGlobal->info(SERVER_NAME);
 
@@ -319,7 +393,11 @@ int main(int argc, const char * argv[])
 
 	LIBRARY->initializeLibrary();
 
-	if(opts.count("creature-values") || opts.count("creature-values-rank"))
+	if(opts.count("creature-duels"))
+	{
+		runCreatureDuels(opts);
+	}
+	else if(opts.count("creature-values") || opts.count("creature-values-rank"))
 	{
 		CreatureValueEstimator::run(opts.count("creature-values-rank") ? opts["creature-values-rank"].as<int>() : 0);
 	}

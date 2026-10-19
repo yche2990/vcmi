@@ -20,6 +20,8 @@ set(vcmiservercommon_SRCS
 		processors/TurnOrderProcessor.cpp
 
 		CGameHandler.cpp
+		BattlegroundGame.cpp
+		CreatureDuels.cpp
 		CreatureValueEstimator.cpp
 		GlobalLobbyProcessor.cpp
 		ServerSpellCastEnvironment.cpp
@@ -51,6 +53,8 @@ set(vcmiservercommon_HEADERS
 		processors/TurnOrderProcessor.h
 
 		CGameHandler.h
+		BattlegroundGame.h
+		CreatureDuels.h
 		CreatureValueEstimator.h
 		GlobalLobbyProcessor.h
 		IGameServer.h
