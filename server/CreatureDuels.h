@@ -35,6 +35,9 @@ public:
 		/// faction's army against the same army led by a stripped hero, and the scale that army is
 		/// even at is written for each build. File with the factions, their armies and builds, as JSON
 		boost::filesystem::path factionBuilds;
+		/// When set, plays the battles this JSON file describes once each and writes down everything
+		/// that happens in them to the output file instead of measuring anything
+		boost::filesystem::path battleTests;
 		/// When set, measures faction armies against each other instead: each side is the army a
 		/// faction raised by some day, led by a real hero of the faction with its specialty, spells,
 		/// commander and the bonuses of its town buildings. For each pair of sides the second side's

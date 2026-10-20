@@ -25,6 +25,9 @@
 #include "../lib/battle/BattleInfo.h"
 #include "../lib/battle/BattleLayout.h"
 #include "../lib/bonuses/BonusEnum.h"
+#include "../lib/bonuses/Bonus.h"
+#include "../lib/CBonusTypeHandler.h"
+#include "../lib/networkPacks/PacksForClientBattle.h"
 #include "../lib/callback/AIFactory.h"
 #include "../lib/callback/CBattleCallback.h"
 #include "../lib/callback/CBattleGameInterface.h"
@@ -200,6 +203,12 @@ public:
 	bool describeNextBattle = false;
 	bool describingBattle = false;
 	BattleSideArray<int> heroSpellsCast = {0, 0};
+	/// Called after each pack of the running battle is applied, for battle tests that log what happens
+	std::function<void(const CPackForClient &, const BattleInfo &)> observer;
+	/// Called once a battle is over, before it is discarded
+	std::function<void(const BattleInfo &, const BattleOutcome &)> finished;
+	/// Terrain the next battles are fought on instead of the battleground's
+	std::optional<TerrainId> terrain;
 
 	void setState(EServerState value) override { state = value; }
 	EServerState getState() const override { return state; }
@@ -616,6 +625,9 @@ BattleOutcome DuelServer::play(const Army & attackerArmy, const HeroBuild * atta
 	for(auto side : {BattleSide::ATTACKER, BattleSide::DEFENDER})
 		outcome.health[side] = healthOf(*battle, side);
 
+	if(finished)
+		finished(*battle, outcome);
+
 	handler->battles->discardBattle(currentBattle);
 	return outcome;
 }
@@ -645,7 +657,7 @@ void DuelServer::replaceBattleSetup(BattleStart & pack) const
 
 	BattleSideArray<const CArmedInstance *> armies = {proposed.getSideArmy(BattleSide::ATTACKER), proposed.getSideArmy(BattleSide::DEFENDER)};
 	BattleSideArray<const CGHeroInstance *> heroes = {proposed.getSideHero(BattleSide::ATTACKER), proposed.getSideHero(BattleSide::DEFENDER)};
-	const auto terrain = game->gameState->getTile(proposed.tile)->getTerrainID();
+	const auto terrain = this->terrain ? *this->terrain : game->gameState->getTile(proposed.tile)->getTerrainID();
 
 	// the battlefield of the terrain may come from a mod and carry bonuses of its own
 	auto replacement = BattleInfo::setupBattle(game->gameState.get(), proposed.tile, terrain, BattlegroundGame::neutralBattlefield(), armies, heroes, proposed.getLayout(), nullptr);
@@ -668,11 +680,8 @@ void DuelServer::applyPack(CPackForClient & pack)
 	{
 		onBattleStarted(start->battleID);
 	}
-	else if(auto * activation = dynamic_cast<BattleSetActiveStack *>(&pack))
+	else if(auto * activation = dynamic_cast<BattleSetActiveStack *>(&pack); activation && activation->reason != BattleUnitTurnReason::AUTOMATIC_ACTION)
 	{
-		if(activation->reason == BattleUnitTurnReason::AUTOMATIC_ACTION)
-			return;
-
 		const BattleInfo * battle = game->gameState->getBattle(activation->battleID);
 		const CStack * stack = battle->battleGetStackByID(activation->stack);
 
@@ -702,6 +711,10 @@ void DuelServer::applyPack(CPackForClient & pack)
 			if(callback->getActiveBattles().count(cancelled->battleID))
 				callback->onBattleEnded(cancelled->battleID);
 	}
+
+	if(observer && currentBattle != BattleID::NONE)
+		if(const BattleInfo * battle = game->gameState->getBattle(currentBattle))
+			observer(pack, *battle);
 }
 
 void DuelServer::onBattleStarted(const BattleID & battleID)
@@ -1418,6 +1431,140 @@ struct ArmyJob
 	std::string key;
 };
 
+/// Identifiers of everything a side of a faction army battle or a battle test can name
+struct SideLookups
+{
+	std::map<std::string, const CCreature *> creatures;
+	std::map<std::string, ArtifactID> artifacts;
+	std::map<std::string, SecondarySkill> skills;
+	std::map<std::string, HeroTypeID> heroTypes;
+	std::map<std::string, SpellID> spells;
+	std::map<std::string, const CFaction *> factions;
+
+	SideLookups();
+};
+
+SideLookups::SideLookups()
+{
+	for(const auto & creature : LIBRARY->creh->objects)
+		if(creature)
+			creatures[creature->getJsonKey()] = creature.get();
+
+	for(const auto & artifact : LIBRARY->arth->objects)
+		if(artifact)
+			artifacts[artifact->getJsonKey()] = artifact->getId();
+
+	for(size_t index = 0; index < LIBRARY->skillh->size(); ++index)
+	{
+		const SecondarySkill skill(static_cast<int32_t>(index));
+		skills[skill.toSkill()->getJsonKey()] = skill;
+	}
+
+	for(const auto & hero : LIBRARY->heroh->objects)
+		if(hero)
+			heroTypes[hero->getJsonKey()] = hero->getId();
+
+	for(const auto & spell : LIBRARY->spellh->objects)
+		if(spell)
+			spells[spell->getJsonKey()] = spell->getId();
+
+	for(const auto & faction : LIBRARY->townh->objects)
+		if(faction)
+			factions[faction->getJsonKey()] = faction.get();
+}
+
+/// Side of a faction army battle or a battle test, as written in their JSON files; what is wrong
+/// with it goes to its error, so that one bad side does not stop the others
+ArmySide parseArmySide(const JsonNode & sideNode, const SideLookups & lookups)
+{
+	ArmySide side;
+	side.id = sideNode["id"].String();
+	side.faction = sideNode["faction"].String();
+	side.experienceRank = static_cast<int>(sideNode["experienceRank"].Integer());
+
+	for(const auto & stackNode : sideNode["army"].Vector())
+	{
+		const auto found = lookups.creatures.find(stackNode[0].String());
+		if(found == lookups.creatures.end())
+			side.error += "unknown creature " + stackNode[0].String() + "; ";
+		else
+			side.army.push_back({found->second, static_cast<int>(stackNode[1].Integer())});
+	}
+	if(side.army.empty())
+		side.error += "empty army; ";
+	if(side.army.size() > GameConstants::ARMY_SIZE)
+		side.error += "more stacks than a hero can lead; ";
+
+	HeroBuild & build = side.build;
+	build.level = static_cast<int>(sideNode["level"].Integer());
+	for(size_t index = 0; index < build.primary.size(); ++index)
+		build.primary[index] = static_cast<int>(sideNode["primary"][index].Integer());
+
+	const auto hero = lookups.heroTypes.find(sideNode["hero"].String());
+	if(hero == lookups.heroTypes.end())
+		side.error += "unknown hero " + sideNode["hero"].String() + "; ";
+	else
+		build.heroType = hero->second;
+
+	for(const auto & skillNode : sideNode["skills"].Vector())
+	{
+		const auto found = lookups.skills.find(skillNode[0].String());
+		if(found == lookups.skills.end())
+			side.error += "unknown skill " + skillNode[0].String() + "; ";
+		else
+			build.skills.emplace_back(found->second, static_cast<int>(skillNode[1].Integer()));
+	}
+	for(const auto & machineNode : sideNode["warMachines"].Vector())
+	{
+		const auto found = lookups.artifacts.find(machineNode.String());
+		if(found == lookups.artifacts.end())
+			side.error += "unknown war machine " + machineNode.String() + "; ";
+		else
+			build.warMachines.push_back(found->second);
+	}
+	for(const auto & spellNode : sideNode["spells"].Vector())
+	{
+		// a spell a mod no longer has is only left out, it does not stop the side
+		const auto found = lookups.spells.find(spellNode.String());
+		if(found != lookups.spells.end())
+			build.spells.push_back(found->second);
+		else
+			logGlobal->warn("Faction armies: %s: unknown spell %s", side.id, spellNode.String());
+	}
+
+	const auto faction = lookups.factions.find(side.faction);
+	if(side.faction.empty())
+	{
+		if(!sideNode["buildings"].Vector().empty())
+			side.error += "buildings need a faction; ";
+	}
+	else if(faction == lookups.factions.end() || !faction->second->town)
+		side.error += "unknown faction " + side.faction + "; ";
+	else
+	{
+		for(const auto & buildingNode : sideNode["buildings"].Vector())
+		{
+			const std::string & name = buildingNode.String();
+			const CBuilding * match = nullptr;
+			for(const auto & [id, building] : faction->second->town->buildings)
+			{
+				const std::string key = building->getJsonKey();
+				if(key == name || boost::algorithm::ends_with(key, ":" + name))
+					match = building.get();
+			}
+			if(match)
+				build.buildings.push_back(match);
+			else
+				logGlobal->warn("Faction armies: %s: town has no building %s", side.id, name);
+		}
+	}
+
+	build.spellbook = sideNode["spellbook"].Bool();
+	build.commander = sideNode["commander"].Bool();
+	build.commanderSeed = stableHash(side.id);
+	return side;
+}
+
 class ArmyRunner
 {
 public:
@@ -1467,122 +1614,12 @@ void ArmyRunner::collectJobs()
 	const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 	const JsonNode root(reinterpret_cast<const std::byte *>(text.data()), text.size(), options.armyJobs.string());
 
-	std::map<std::string, const CCreature *> creatures;
-	for(const auto & creature : LIBRARY->creh->objects)
-		if(creature)
-			creatures[creature->getJsonKey()] = creature.get();
-
-	std::map<std::string, ArtifactID> artifacts;
-	for(const auto & artifact : LIBRARY->arth->objects)
-		if(artifact)
-			artifacts[artifact->getJsonKey()] = artifact->getId();
-
-	std::map<std::string, SecondarySkill> skills;
-	for(size_t index = 0; index < LIBRARY->skillh->size(); ++index)
-	{
-		const SecondarySkill skill(static_cast<int32_t>(index));
-		skills[skill.toSkill()->getJsonKey()] = skill;
-	}
-
-	std::map<std::string, HeroTypeID> heroTypes;
-	for(const auto & hero : LIBRARY->heroh->objects)
-		if(hero)
-			heroTypes[hero->getJsonKey()] = hero->getId();
-
-	std::map<std::string, SpellID> spells;
-	for(const auto & spell : LIBRARY->spellh->objects)
-		if(spell)
-			spells[spell->getJsonKey()] = spell->getId();
-
-	std::map<std::string, const CFaction *> factions;
-	for(const auto & faction : LIBRARY->townh->objects)
-		if(faction)
-			factions[faction->getJsonKey()] = faction.get();
+	const SideLookups lookups;
 
 	std::map<std::string, size_t> sideIndex;
 	for(const auto & sideNode : root["sides"].Vector())
 	{
-		ArmySide side;
-		side.id = sideNode["id"].String();
-		side.faction = sideNode["faction"].String();
-		side.experienceRank = static_cast<int>(sideNode["experienceRank"].Integer());
-
-		for(const auto & stackNode : sideNode["army"].Vector())
-		{
-			const auto found = creatures.find(stackNode[0].String());
-			if(found == creatures.end())
-				side.error += "unknown creature " + stackNode[0].String() + "; ";
-			else
-				side.army.push_back({found->second, static_cast<int>(stackNode[1].Integer())});
-		}
-		if(side.army.empty())
-			side.error += "empty army; ";
-		if(side.army.size() > GameConstants::ARMY_SIZE)
-			side.error += "more stacks than a hero can lead; ";
-
-		HeroBuild & build = side.build;
-		build.level = static_cast<int>(sideNode["level"].Integer());
-		for(size_t index = 0; index < build.primary.size(); ++index)
-			build.primary[index] = static_cast<int>(sideNode["primary"][index].Integer());
-
-		const auto hero = heroTypes.find(sideNode["hero"].String());
-		if(hero == heroTypes.end())
-			side.error += "unknown hero " + sideNode["hero"].String() + "; ";
-		else
-			build.heroType = hero->second;
-
-		for(const auto & skillNode : sideNode["skills"].Vector())
-		{
-			const auto found = skills.find(skillNode[0].String());
-			if(found == skills.end())
-				side.error += "unknown skill " + skillNode[0].String() + "; ";
-			else
-				build.skills.emplace_back(found->second, static_cast<int>(skillNode[1].Integer()));
-		}
-		for(const auto & machineNode : sideNode["warMachines"].Vector())
-		{
-			const auto found = artifacts.find(machineNode.String());
-			if(found == artifacts.end())
-				side.error += "unknown war machine " + machineNode.String() + "; ";
-			else
-				build.warMachines.push_back(found->second);
-		}
-		for(const auto & spellNode : sideNode["spells"].Vector())
-		{
-			// a spell a mod no longer has is only left out, it does not stop the side
-			const auto found = spells.find(spellNode.String());
-			if(found != spells.end())
-				build.spells.push_back(found->second);
-			else
-				logGlobal->warn("Faction armies: %s: unknown spell %s", side.id, spellNode.String());
-		}
-
-		const auto faction = factions.find(side.faction);
-		if(faction == factions.end() || !faction->second->town)
-			side.error += "unknown faction " + side.faction + "; ";
-		else
-		{
-			for(const auto & buildingNode : sideNode["buildings"].Vector())
-			{
-				const std::string & name = buildingNode.String();
-				const CBuilding * match = nullptr;
-				for(const auto & [id, building] : faction->second->town->buildings)
-				{
-					const std::string key = building->getJsonKey();
-					if(key == name || boost::algorithm::ends_with(key, ":" + name))
-						match = building.get();
-				}
-				if(match)
-					build.buildings.push_back(match);
-				else
-					logGlobal->warn("Faction armies: %s: town has no building %s", side.id, name);
-			}
-		}
-
-		build.spellbook = sideNode["spellbook"].Bool();
-		build.commander = sideNode["commander"].Bool();
-		build.commanderSeed = stableHash(side.id);
-
+		ArmySide side = parseArmySide(sideNode, lookups);
 		sideIndex[side.id] = sides.size();
 		sides.push_back(std::move(side));
 	}
@@ -1782,12 +1819,319 @@ void ArmyRunner::run()
 	boost::filesystem::remove(markerPath());
 	logGlobal->info("Faction armies complete");
 }
+
+/// Plays the battles a JSON file describes once each and writes down everything that happens in
+/// them: actions, damage with friendly fire marked, and every change to each unit's count, position
+/// and bonuses. For checking abilities and combat scripts without starting the game
+class BattleTestRunner
+{
+public:
+	explicit BattleTestRunner(const CreatureDuels::Options & options)
+		: options(options)
+	{
+	}
+
+	void run();
+
+private:
+	struct UnitSnapshot
+	{
+		bool alive = false;
+		int count = 0;
+		int firstHP = 0;
+		int position = -1;
+		std::set<std::string> bonuses;
+	};
+
+	const CreatureDuels::Options & options;
+	std::ofstream out;
+	std::map<uint32_t, UnitSnapshot> snapshots;
+	/// Unit whose action or spell is being carried out, for damage that names no attacker
+	uint32_t actor = -1;
+	int damageEvents = 0;
+	int friendlyFire = 0;
+
+	static std::string unitName(const BattleInfo & battle, uint32_t id);
+	static std::string bonusText(const Bonus & bonus);
+	static UnitSnapshot snapshot(const CStack & stack);
+	void compare(const BattleInfo & battle, bool initial);
+	void observe(const CPackForClient & pack, const BattleInfo & battle);
+	void logDamage(const BattleInfo & battle, const BattleStackAttacked & attack, uint32_t fallbackAttacker);
+	void logEnd(const BattleInfo & battle, const BattleOutcome & outcome);
+};
+
+std::string BattleTestRunner::unitName(const BattleInfo & battle, uint32_t id)
+{
+	const CStack * stack = battle.battleGetStackByID(id, false);
+	if(!stack)
+		return "unit#" + std::to_string(id);
+
+	const std::string side = stack->unitSide() == BattleSide::ATTACKER ? "A" : "D";
+	return boost::str(boost::format("%s:%s#%d") % side % stack->unitType()->getNameSingularTranslated() % id);
+}
+
+std::string BattleTestRunner::bonusText(const Bonus & bonus)
+{
+	// written out by hand: limiters and updaters of some mods cannot be turned back into JSON
+	std::string text = LIBRARY->bth->bonusToString(bonus.type);
+
+	if(bonus.subtype != BonusSubtypeID())
+		text += "(" + std::to_string(bonus.subtype.getNum()) + ")";
+	text += " val=" + std::to_string(bonus.val);
+	if(bonus.valType != BonusValueType::ADDITIVE_VALUE)
+		text += " " + vstd::findKey(bonusValueMap, bonus.valType);
+	if(bonus.duration != BonusDuration::PERMANENT)
+		text += " duration=" + std::to_string(static_cast<int>(bonus.duration));
+	if(bonus.turnsRemain)
+		text += " turns=" + std::to_string(bonus.turnsRemain);
+	text += " from=" + vstd::findKey(bonusSourceMap, bonus.source);
+	if(bonus.sid != BonusSourceID())
+		text += ":" + std::to_string(bonus.sid.getNum());
+	if(!bonus.stacking.empty())
+		text += " stacking=" + bonus.stacking;
+	if(!bonus.description.empty())
+		text += " \"" + bonus.description.toString(LIBRARY->staticTexts()) + "\"";
+	if(bonus.hidden)
+		text += " hidden";
+	return text;
+}
+
+BattleTestRunner::UnitSnapshot BattleTestRunner::snapshot(const CStack & stack)
+{
+	UnitSnapshot result;
+	result.alive = stack.alive();
+	result.count = stack.getCount();
+	result.firstHP = stack.getFirstHPleft();
+	result.position = stack.getPosition().toInt();
+	// kept in a variable, as the list would not outlive the loop over a temporary
+	const auto bonuses = stack.getAllBonuses(Selector::all);
+	for(const auto & bonus : *bonuses)
+		result.bonuses.insert(bonusText(*bonus));
+	return result;
+}
+
+void BattleTestRunner::compare(const BattleInfo & battle, bool initial)
+{
+	initial = initial || snapshots.empty();
+	for(const auto & stack : battle.stacks)
+	{
+		const uint32_t id = stack->unitId();
+		UnitSnapshot now = snapshot(*stack);
+		const auto previous = snapshots.find(id);
+
+		if(previous == snapshots.end())
+		{
+			out << boost::str(boost::format("  %s %s: %d x, first %d HP, hex %d, %d bonuses\n")
+				% (initial ? "unit" : "APPEARS") % unitName(battle, id) % now.count % now.firstHP % now.position % now.bonuses.size());
+			snapshots[id] = std::move(now);
+			continue;
+		}
+
+		const UnitSnapshot & before = previous->second;
+		const std::string name = unitName(battle, id);
+		if(before.alive != now.alive)
+			out << "  " << name << (now.alive ? " REVIVED" : " DIED") << "\n";
+		if(before.count != now.count || before.firstHP != now.firstHP)
+			out << boost::str(boost::format("  %s: %d x (%d HP) -> %d x (%d HP)\n") % name % before.count % before.firstHP % now.count % now.firstHP);
+		if(before.position != now.position)
+			out << boost::str(boost::format("  %s: hex %d -> %d\n") % name % before.position % now.position);
+		for(const auto & text : before.bonuses)
+			if(!now.bonuses.count(text))
+				out << "  " << name << " - " << text << "\n";
+		for(const auto & text : now.bonuses)
+			if(!before.bonuses.count(text))
+				out << "  " << name << " + " << text << "\n";
+
+		previous->second = std::move(now);
+	}
+}
+
+void BattleTestRunner::logDamage(const BattleInfo & battle, const BattleStackAttacked & attack, uint32_t fallbackAttacker)
+{
+	const uint32_t attacker = attack.attackerID != static_cast<ui32>(-1) ? attack.attackerID : fallbackAttacker;
+	const CStack * source = battle.battleGetStackByID(attacker, false);
+	const CStack * victim = battle.battleGetStackByID(attack.stackAttacked, false);
+	// damage a unit deals itself is reflected, e.g. by a fire shield, and is no friendly fire
+	const bool friendly = source && victim && source != victim && source->unitSide() == victim->unitSide() && attack.damageAmount > 0;
+
+	++damageEvents;
+	if(friendly)
+		++friendlyFire;
+
+	std::string spell;
+	if(attack.isSpell() && attack.spellID.hasValue())
+		spell = " by spell " + attack.spellID.toSpell()->getJsonKey();
+
+	out << boost::str(boost::format("  DAMAGE %s -> %s: %d damage, %d killed%s%s%s%s\n")
+		% (source ? unitName(battle, attacker) : std::string("(no unit)"))
+		% unitName(battle, attack.stackAttacked)
+		% attack.damageAmount % attack.killedAmount
+		% spell
+		% (attack.isSecondary() ? " (secondary)" : "")
+		% (attack.killed() ? " (stack killed)" : "")
+		% (friendly ? "   <<< FRIENDLY FIRE" : source == victim && source ? " (reflected)" : ""));
+}
+
+void BattleTestRunner::observe(const CPackForClient & pack, const BattleInfo & battle)
+{
+	if(dynamic_cast<const BattleStart *>(&pack))
+	{
+		// units are not part of the bonus system yet, they are compared from the first round on
+		snapshots.clear();
+		out << "Battle starts\n";
+	}
+	else if(dynamic_cast<const BattleNextRound *>(&pack))
+	{
+		compare(battle, false);
+		out << boost::str(boost::format("==== Round %d ====\n") % battle.getRound());
+	}
+	else if(const auto * activation = dynamic_cast<const BattleSetActiveStack *>(&pack))
+	{
+		compare(battle, false);
+		out << "-> " << unitName(battle, activation->stack) << " is active\n";
+	}
+	else if(const auto * started = dynamic_cast<const StartAction *>(&pack))
+	{
+		static const std::map<EActionType, std::string> names = {
+			{EActionType::HERO_SPELL, "hero spell"}, {EActionType::WALK, "walk"}, {EActionType::WAIT, "wait"},
+			{EActionType::DEFEND, "defend"}, {EActionType::WALK_AND_ATTACK, "attack"}, {EActionType::SHOOT, "shoot"},
+			{EActionType::MONSTER_SPELL, "cast"}, {EActionType::BAD_MORALE, "bad morale"}, {EActionType::STACK_HEAL, "heal"},
+			{EActionType::WALK_AND_CAST, "walk and cast"}, {EActionType::WALK_AND_ATTACK_NO_RETURN, "attack (no return)"},
+			{EActionType::LONG_WEAPON_ATTACK, "long weapon attack"}, {EActionType::RANDOM_SPELL, "random spell"}};
+		const BattleAction & action = started->ba;
+		const auto name = names.find(action.actionType);
+		const std::string what = name != names.end() ? name->second : "action " + std::to_string(static_cast<int>(action.actionType));
+		if(action.actionType == EActionType::HERO_SPELL)
+		{
+			actor = -1;
+			out << boost::str(boost::format("  %s hero casts %s\n") % (action.side == BattleSide::ATTACKER ? "A" : "D") % (action.spell.hasValue() ? action.spell.toSpell()->getJsonKey() : std::string("?")));
+		}
+		else
+		{
+			actor = action.stackNumber;
+			out << "  " << unitName(battle, action.stackNumber) << ": " << what;
+			if(action.spell.hasValue())
+				out << " " << action.spell.toSpell()->getJsonKey();
+			out << "\n";
+		}
+	}
+	else if(const auto * cast = dynamic_cast<const BattleSpellCast *>(&pack))
+	{
+		if(cast->casterStack >= 0)
+			actor = cast->casterStack;
+		std::string targets;
+		for(const auto id : cast->affectedCres)
+			targets += " " + unitName(battle, id);
+		out << boost::str(boost::format("  SPELL %s by %s%s%s\n")
+			% (cast->spellID.hasValue() ? cast->spellID.toSpell()->getJsonKey() : std::string("?"))
+			% (cast->casterStack >= 0 ? unitName(battle, cast->casterStack) : std::string(cast->castByHero ? "hero" : "?"))
+			% (targets.empty() ? "" : " on")
+			% targets);
+	}
+	else if(const auto * attack = dynamic_cast<const BattleAttack *>(&pack))
+	{
+		for(const auto & hit : attack->bsa)
+			logDamage(battle, hit, attack->stackAttacking);
+	}
+	else if(const auto * injured = dynamic_cast<const StacksInjured *>(&pack))
+	{
+		for(const auto & hit : injured->stacks)
+			logDamage(battle, hit, actor);
+	}
+	else if(const auto * message = dynamic_cast<const BattleLogMessage *>(&pack))
+	{
+		for(const auto & line : message->lines)
+			out << "  LOG " << line.toString(LIBRARY->staticTexts()) << "\n";
+	}
+	else if(const auto * moved = dynamic_cast<const BattleStackMoved *>(&pack))
+	{
+		if(moved->teleporting)
+			out << "  " << unitName(battle, moved->stack) << " teleported\n";
+	}
+	else if(dynamic_cast<const EndAction *>(&pack))
+	{
+		compare(battle, false);
+	}
+}
+
+void BattleTestRunner::logEnd(const BattleInfo & battle, const BattleOutcome & outcome)
+{
+	compare(battle, false);
+	out << boost::str(boost::format("Battle over after %d rounds%s: attacker keeps %.1f%% of its health, defender %.1f%%\n")
+		% outcome.rounds % (outcome.limited ? " (limit reached)" : "")
+		% (outcome.health[BattleSide::ATTACKER].shareLeft() * 100) % (outcome.health[BattleSide::DEFENDER].shareLeft() * 100));
+	out << boost::str(boost::format("%d damage events, %d of them friendly fire, %d actions rejected\n\n") % damageEvents % friendlyFire % outcome.rejected);
+}
+
+void BattleTestRunner::run()
+{
+	std::ifstream file(options.battleTests.c_str(), std::ios::binary);
+	if(!file)
+		throw std::runtime_error("Unable to open battle tests " + options.battleTests.string());
+	const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+	const JsonNode root(reinterpret_cast<const std::byte *>(text.data()), text.size(), options.battleTests.string());
+
+	out.open(options.output.c_str());
+	const SideLookups lookups;
+
+	for(const auto & testNode : root["tests"].Vector())
+	{
+		const std::string name = testNode["name"].String();
+		ArmySide attacker = parseArmySide(testNode["attacker"], lookups);
+		ArmySide defender = parseArmySide(testNode["defender"], lookups);
+		const int battles = std::max<int>(1, static_cast<int>(testNode["battles"].Integer()));
+
+		out << "######## " << name << "\n";
+		if(!attacker.error.empty() || !defender.error.empty())
+		{
+			out << "ERROR attacker: " << attacker.error << " defender: " << defender.error << "\n\n";
+			logGlobal->error("Battle tests: %s: %s %s", name, attacker.error, defender.error);
+			continue;
+		}
+
+		BattleLimits limits;
+		limits.rounds = testNode["rounds"].isNull() ? 30 : static_cast<int>(testNode["rounds"].Integer());
+		DuelServer server(options.battleAI, 0, !testNode["heroSpells"].isNull() ? testNode["heroSpells"].Bool() : true, limits);
+		if(!testNode["terrain"].isNull())
+			server.terrain = TerrainId(TerrainId::decode(testNode["terrain"].String()));
+		server.observer = [this](const CPackForClient & pack, const BattleInfo & battle) { observe(pack, battle); };
+		server.finished = [this](const BattleInfo & battle, const BattleOutcome & outcome) { logEnd(battle, outcome); };
+
+		for(int index = 0; index < battles; ++index)
+		{
+			const int seed = static_cast<int>(testNode["seed"].Integer()) + index;
+			out << "---- battle " << index + 1 << ", seed " << seed << "\n";
+			damageEvents = 0;
+			friendlyFire = 0;
+			actor = -1;
+			try
+			{
+				server.setExperienceRanks(attacker.experienceRank, defender.experienceRank);
+				server.play(attacker.army, &attacker.build, defender.army, &defender.build, seed);
+			}
+			catch(const std::exception & e)
+			{
+				out << "ERROR " << e.what() << "\n\n";
+				logGlobal->error("Battle tests: %s failed: %s", name, e.what());
+			}
+			out.flush();
+		}
+	}
+	logGlobal->info("Battle tests complete, written to %s", options.output.string());
+}
 }
 
 void CreatureDuels::run(const Options & options)
 {
 	if(options.shardCount < 1 || options.shardIndex < 0 || options.shardIndex >= options.shardCount)
 		throw std::runtime_error("Invalid creature duels shard");
+
+	if(!options.battleTests.empty())
+	{
+		BattleTestRunner runner(options);
+		runner.run();
+		return;
+	}
 
 	if(!options.armyJobs.empty())
 	{
