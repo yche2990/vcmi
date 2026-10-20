@@ -259,6 +259,9 @@ static void handleCommandOptions(int argc, const char * argv[], boost::program_o
 	("faction-heroes", boost::program_options::value<std::string>(), "Measure hero builds of factions: each build leads its faction's army against the same army led by a stripped hero, results are appended to given CSV file")
 	("faction-heroes-builds", boost::program_options::value<std::string>(), "JSON file with factions, their armies and the hero builds to measure")
 	("faction-heroes-shard", boost::program_options::value<std::string>(), "Part of builds to measure in this process, as index/count with index starting at 1, e.g. 2/4")
+	("faction-armies", boost::program_options::value<std::string>(), "Measure faction armies against each other: for each pair of sides the second army is scaled until the two are even, results are appended to given CSV file")
+	("faction-armies-jobs", boost::program_options::value<std::string>(), "JSON file with the sides (army, hero, spells, buildings) and the pairs to measure")
+	("faction-armies-shard", boost::program_options::value<std::string>(), "Part of pairs to measure in this process, as index/count with index starting at 1, e.g. 2/4")
 	("translate-mod", boost::program_options::value<std::string>(), "Export translations for specified mod")
 	("export-lua-docs", boost::program_options::value<std::string>(), "Export Lua scripting API documentation to specified directory")
 	("port", boost::program_options::value<ui16>(), "port at which server will listen to connections from client")
@@ -335,10 +338,10 @@ static std::string serverLogName(int argc, const char * argv[])
 	for(int index = 1; index < argc; ++index)
 	{
 		const std::string argument = argv[index];
-		for(const std::string option : {"creature-duels", "faction-heroes"})
+		for(const std::string option : {"creature-duels", "faction-heroes", "faction-armies"})
 		{
 			if(argument == "--" + option || argument.starts_with("--" + option + "="))
-				mode = option == "creature-duels" ? "duels" : "factions";
+				mode = option == "creature-duels" ? "duels" : option == "faction-heroes" ? "factions" : "armies";
 			if(argument == "--" + option + "-shard" && index + 1 < argc)
 				shard = argv[index + 1];
 			if(argument.starts_with("--" + option + "-shard="))
@@ -382,6 +385,21 @@ static void runFactionHeroes(const boost::program_options::variables_map & opts)
 	CreatureDuels::run(options);
 }
 
+static void runFactionArmies(const boost::program_options::variables_map & opts)
+{
+	CreatureDuels::Options options;
+	options.output = opts["faction-armies"].as<std::string>();
+	if(!opts.count("faction-armies-jobs"))
+		throw std::runtime_error("Faction armies need --faction-armies-jobs");
+	options.armyJobs = opts["faction-armies-jobs"].as<std::string>();
+	if(opts.count("faction-armies-shard"))
+		std::tie(options.shardIndex, options.shardCount) = parseShard(opts["faction-armies-shard"].as<std::string>());
+	if(opts.count("creature-duels-ai"))
+		options.battleAI = opts["creature-duels-ai"].as<std::string>();
+
+	CreatureDuels::run(options);
+}
+
 static void runCreatureDuels(const boost::program_options::variables_map & opts)
 {
 	CreatureDuels::Options options;
@@ -416,12 +434,16 @@ int main(int argc, const char * argv[])
 	LIBRARY->initializeFilesystem(false);
 	logConfigurator.configure();
 
-	if(opts.count("creature-duels") || opts.count("faction-heroes"))
+	if(opts.count("creature-duels") || opts.count("faction-heroes") || opts.count("faction-armies"))
 		limitLogLevel(ELogLevel::INFO);
 
 	LIBRARY->initializeLibrary();
 
-	if(opts.count("faction-heroes"))
+	if(opts.count("faction-armies"))
+	{
+		runFactionArmies(opts);
+	}
+	else if(opts.count("faction-heroes"))
 	{
 		runFactionHeroes(opts);
 	}

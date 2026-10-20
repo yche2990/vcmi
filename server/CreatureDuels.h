@@ -35,6 +35,11 @@ public:
 		/// faction's army against the same army led by a stripped hero, and the scale that army is
 		/// even at is written for each build. File with the factions, their armies and builds, as JSON
 		boost::filesystem::path factionBuilds;
+		/// When set, measures faction armies against each other instead: each side is the army a
+		/// faction raised by some day, led by a real hero of the faction with its specialty, spells,
+		/// commander and the bonuses of its town buildings. For each pair of sides the second side's
+		/// army is scaled until the two are even. File with the sides and pairs, as JSON
+		boost::filesystem::path armyJobs;
 	};
 
 	static void run(const Options & options);

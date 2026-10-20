@@ -34,6 +34,17 @@
 #include "../lib/entities/artifact/CArtHandler.h"
 #include "../lib/entities/artifact/CArtifact.h"
 #include "../lib/entities/artifact/CArtifactInstance.h"
+#include "../lib/entities/building/CBuilding.h"
+#include "../lib/entities/faction/CFaction.h"
+#include "../lib/entities/faction/CTown.h"
+#include "../lib/entities/faction/CTownHandler.h"
+#include "../lib/entities/hero/CHero.h"
+#include "../lib/entities/hero/CHeroClass.h"
+#include "../lib/entities/hero/CHeroHandler.h"
+#include "../lib/bonuses/Propagators.h"
+#include "../lib/CRandomGenerator.h"
+#include "../lib/IGameSettings.h"
+#include "../lib/spells/CSpellHandler.h"
 #include "../lib/gameState/CGameState.h"
 #include "../lib/json/JsonNode.h"
 #include "../lib/mapObjects/CGHeroInstance.h"
@@ -95,6 +106,15 @@ struct HeroBuild
 	/// war machines, as the artifacts a hero carries them as
 	std::vector<ArtifactID> warMachines;
 	bool spellbook = false;
+	/// Real hero whose specialty and class the side gets, NONE keeps the battleground hero's class
+	HeroTypeID heroType = HeroTypeID::NONE;
+	/// Spells in the spellbook; only those the hero can learn are kept, as wisdom limits them
+	std::vector<SpellID> spells;
+	/// Town buildings whose bonuses for all of the player's units the army gets
+	std::vector<const CBuilding *> buildings;
+	/// Whether the hero leads the commander of its class, raised to the hero's level
+	bool commander = false;
+	uint32_t commanderSeed = 0;
 };
 
 /// Health of the units a side started a battle with, ignoring summoned units and clones
@@ -174,6 +194,12 @@ public:
 
 	BattleOutcome play(const CCreature * left, int leftCount, const CCreature * right, int rightCount, int seed);
 	BattleOutcome play(const Army & attacker, const HeroBuild * attackerHero, const Army & defender, const HeroBuild * defenderHero, int seed);
+	/// Stack experience rank of each side in the next battles, instead of the server's rank; negative keeps it
+	void setExperienceRanks(int attacker, int defender) { sideRanks = {attacker, defender}; }
+	/// Logs what each hero brings to the next battle: specialty, commander, spells, building bonuses
+	bool describeNextBattle = false;
+	bool describingBattle = false;
+	BattleSideArray<int> heroSpellsCast = {0, 0};
 
 	void setState(EServerState value) override { state = value; }
 	EServerState getState() const override { return state; }
@@ -189,6 +215,9 @@ public:
 private:
 	EServerState state = EServerState::GAMEPLAY;
 	int experienceRank;
+	BattleSideArray<int> sideRanks = {-1, -1};
+	BattleSideArray<HeroTypeID> appliedHeroType = {HeroTypeID::NONE, HeroTypeID::NONE};
+	BattleSideArray<std::vector<std::shared_ptr<Bonus>>> addedBuildingBonuses;
 	std::string battleAI;
 	bool heroSpells;
 	BattleLimits limits;
@@ -212,6 +241,10 @@ private:
 	void removeBattleParticipants();
 	void removeArtifacts(CGHeroInstance * hero);
 	void prepareHero(BattleSide side, const HeroBuild * build);
+	void applyHeroType(BattleSide side, HeroTypeID type);
+	void applyBuildingBonuses(BattleSide side, const HeroBuild * build);
+	void applyCommander(BattleSide side, const HeroBuild * build);
+	void applySpells(BattleSide side, const HeroBuild * build);
 	void setArmy(BattleSide side, const Army & army);
 	void replaceBattleSetup(BattleStart & pack) const;
 	void onBattleStarted(const BattleID & battleID);
@@ -307,7 +340,11 @@ void DuelServer::prepareHero(BattleSide side, const HeroBuild * build)
 	CGHeroInstance * hero = game->heroes[side];
 	auto & map = game->gameState->getMap();
 
-	if(!build && hero->secSkills.empty() && hero->level == 1 && hero->artifactsWorn.empty())
+	applyHeroType(side, build ? build->heroType : HeroTypeID::NONE);
+	applyBuildingBonuses(side, build);
+	applyCommander(side, build);
+
+	if(!build && hero->secSkills.empty() && hero->level == 1 && hero->artifactsWorn.empty() && hero->getSpellsInSpellbook().empty())
 		return; // already stripped, which is what every creature duel has
 
 	removeArtifacts(hero);
@@ -344,7 +381,96 @@ void DuelServer::prepareHero(BattleSide side, const HeroBuild * build)
 		}
 	}
 
+	// after the skills, as wisdom decides which spells the hero can learn
+	applySpells(side, build);
+
 	hero->mana = build ? hero->manaLimit() : 0;
+}
+
+void DuelServer::applyHeroType(BattleSide side, HeroTypeID type)
+{
+	CGHeroInstance * hero = game->heroes[side];
+	if(appliedHeroType[side] == type)
+		return;
+
+	if(appliedHeroType[side] != HeroTypeID::NONE)
+		for(const auto & bonus : appliedHeroType[side].toHeroType()->specialty)
+			hero->removeBonus(bonus);
+
+	appliedHeroType[side] = type;
+	if(type == HeroTypeID::NONE)
+		return;
+
+	hero->setHeroType(type);
+	for(const auto & bonus : type.toHeroType()->specialty)
+		hero->addNewBonus(bonus);
+}
+
+void DuelServer::applyBuildingBonuses(BattleSide side, const HeroBuild * build)
+{
+	CGHeroInstance * hero = game->heroes[side];
+	for(const auto & bonus : addedBuildingBonuses[side])
+		hero->removeBonus(bonus);
+	addedBuildingBonuses[side].clear();
+
+	if(!build)
+		return;
+
+	// bonuses a town building gives all units of its player reach the army through its hero
+	for(const CBuilding * building : build->buildings)
+	{
+		for(const auto & bonus : building->buildingBonuses)
+		{
+			if(!bonus->propagator || bonus->propagator->getPropagatorType() != BonusNodeType::PLAYER)
+				continue;
+
+			auto copy = std::make_shared<Bonus>(*bonus);
+			copy->propagator.reset();
+			hero->addNewBonus(copy);
+			addedBuildingBonuses[side].push_back(copy);
+		}
+	}
+}
+
+void DuelServer::applyCommander(BattleSide side, const HeroBuild * build)
+{
+	CGHeroInstance * hero = game->heroes[side];
+	const bool wanted = build && build->commander
+		&& game->gameState->getSettings().getBoolean(EGameSettings::MODULE_COMMANDERS)
+		&& hero->getHeroClass()->commander.hasValue();
+
+	if(!wanted)
+	{
+		if(hero->getCommander())
+			hero->getCommander()->setAlive(false);
+		return;
+	}
+
+	auto commander = std::make_unique<CCommanderInstance>(game->gameState.get(), hero->getHeroClass()->commander);
+	commander->setArmy(hero);
+	CRandomGenerator random(static_cast<int>(build->commanderSeed));
+	const uint32_t level = static_cast<uint32_t>(std::max(1, build->level));
+	while(commander->level < level)
+		commander->levelUpAutomatically(random);
+	hero->replaceCommander(std::move(commander));
+}
+
+void DuelServer::applySpells(BattleSide side, const HeroBuild * build)
+{
+	CGHeroInstance * hero = game->heroes[side];
+	const std::set<SpellID> known = hero->getSpellsInSpellbook();
+	for(const auto & spell : known)
+		hero->removeSpellFromSpellbook(spell);
+
+	if(!build || build->heroType == HeroTypeID::NONE)
+		return;
+
+	for(const auto & spell : hero->getHeroType()->spells)
+		hero->addSpellToSpellbook(spell);
+
+	for(const auto & spell : build->spells)
+		if(hero->canLearnSpell(spell.toSpell()))
+			hero->addSpellToSpellbook(spell);
 }
 
 void DuelServer::setArmy(BattleSide side, const Army & army)
@@ -361,10 +487,11 @@ void DuelServer::setArmy(BattleSide side, const Army & army)
 		const int count = army[index].count;
 		auto stack = std::make_unique<CStackInstance>(game->gameState.get(), creature->getId(), count);
 
-		if(experienceRank > 0)
+		const int wantedRank = sideRanks[side] >= 0 ? sideRanks[side] : experienceRank;
+		if(wantedRank > 0)
 		{
 			const auto & ranks = LIBRARY->creh->expRanks.at(vstd::iswithin(creature->getLevel(), 1, 7) ? creature->getLevel() : 0);
-			const int rank = std::clamp<int>(experienceRank, 1, static_cast<int>(ranks.size()) - 1);
+			const int rank = std::clamp<int>(wantedRank, 1, static_cast<int>(ranks.size()) - 1);
 			stack->giveTotalStackExperience(static_cast<TExpType>(ranks.at(rank - 1)) * count);
 		}
 
@@ -383,6 +510,26 @@ BattleOutcome DuelServer::play(const Army & attackerArmy, const HeroBuild * atta
 	prepareHero(BattleSide::DEFENDER, defenderHero);
 	setArmy(BattleSide::ATTACKER, attackerArmy);
 	setArmy(BattleSide::DEFENDER, defenderArmy);
+
+	heroSpellsCast = {0, 0};
+	describingBattle = describeNextBattle;
+	if(describeNextBattle)
+	{
+		describeNextBattle = false;
+		for(auto side : {BattleSide::ATTACKER, BattleSide::DEFENDER})
+		{
+			const CGHeroInstance * hero = game->heroes[side];
+			const CCommanderInstance * commander = hero->getCommander();
+			logGlobal->info("Faction armies: %s hero %s (%s) level %d, %d/%d/%d/%d, %d skills, %d spells, %d specialty and %d building bonuses, commander %s",
+				side == BattleSide::ATTACKER ? "attacker" : "defender",
+				hero->getHeroType()->getJsonKey(), hero->getHeroClass()->getJsonKey(), static_cast<int>(hero->level),
+				hero->getPrimSkillLevel(PrimarySkill::ATTACK), hero->getPrimSkillLevel(PrimarySkill::DEFENSE),
+				hero->getPrimSkillLevel(PrimarySkill::SPELL_POWER), hero->getPrimSkillLevel(PrimarySkill::KNOWLEDGE),
+				static_cast<int>(hero->secSkills.size()), static_cast<int>(hero->getSpellsInSpellbook().size()),
+				static_cast<int>(hero->getHeroType()->specialty.size()), static_cast<int>(addedBuildingBonuses[side].size()),
+				commander && commander->alive ? commander->getCreature()->getJsonKey() + " level " + std::to_string(commander->level) : std::string("none"));
+		}
+	}
 
 	pending.clear();
 	currentAction.reset();
@@ -455,6 +602,17 @@ BattleOutcome DuelServer::play(const Army & attackerArmy, const HeroBuild * atta
 		outcome.limited = true;
 
 	outcome.rounds = battle->getRound();
+
+	if(describingBattle)
+	{
+		int commanders = 0;
+		for(const auto & stack : battle->stacks)
+			if(stack->unitSlot() == SlotID::COMMANDER_SLOT_PLACEHOLDER)
+				++commanders;
+		logGlobal->info("Faction armies: first battle took %d rounds, hero spells cast %d by attacker and %d by defender, %d commanders took part",
+			battle->getRound(), heroSpellsCast[BattleSide::ATTACKER], heroSpellsCast[BattleSide::DEFENDER], commanders);
+		describingBattle = false;
+	}
 	for(auto side : {BattleSide::ATTACKER, BattleSide::DEFENDER})
 		outcome.health[side] = healthOf(*battle, side);
 
@@ -469,7 +627,8 @@ SideHealth DuelServer::healthOf(const BattleInfo & battle, BattleSide side) cons
 	for(const auto & stack : battle.stacks)
 	{
 		// war machines are not part of the army that is measured
-		if(stack->unitSide() != side || stack->summoned || stack->isClone() || stack->unitSlot() == SlotID::WAR_MACHINES_SLOT)
+		// neither are war machines and the commander, which come with the hero
+		if(stack->unitSide() != side || stack->summoned || stack->isClone() || stack->unitSlot() == SlotID::WAR_MACHINES_SLOT || stack->unitSlot() == SlotID::COMMANDER_SLOT_PLACEHOLDER)
 			continue;
 
 		result.initial += static_cast<int64_t>(stack->unitBaseAmount()) * stack->getMaxHealth();
@@ -527,6 +686,8 @@ void DuelServer::applyPack(CPackForClient & pack)
 	else if(auto * started = dynamic_cast<StartAction *>(&pack))
 	{
 		currentAction = started->ba;
+		if(started->ba.actionType == EActionType::HERO_SPELL)
+			++heroSpellsCast[started->ba.side];
 	}
 	else if(auto * ended = dynamic_cast<EndAction *>(&pack))
 	{
@@ -1237,12 +1398,403 @@ void FactionRunner::run()
 	logGlobal->info("Faction heroes complete");
 }
 
+
+/// One side of a faction army battle: the army a faction raised by some day, and the hero leading it
+struct ArmySide
+{
+	std::string id;
+	std::string faction;
+	Army army;
+	HeroBuild build;
+	int experienceRank = 0;
+	std::string error;
+};
+
+/// Two sides of faction army battles: the second side's army is scaled until the two are even
+struct ArmyJob
+{
+	size_t first = 0;
+	size_t second = 0;
+	std::string key;
+};
+
+class ArmyRunner
+{
+public:
+	explicit ArmyRunner(const CreatureDuels::Options & options);
+	void run();
+
+private:
+	const CreatureDuels::Options & options;
+	std::unique_ptr<DuelServer> server;
+
+	std::vector<ArmySide> sides;
+	std::vector<ArmyJob> jobs;
+	std::set<std::string> done;
+
+	static DuelServer * createServer(const CreatureDuels::Options & options);
+	boost::filesystem::path markerPath() const;
+	void collectJobs();
+	void loadDone();
+	void recoverCrashedJob();
+	JobResult measure(const ArmyJob & job);
+	void writeResult(const ArmyJob & job, const JobResult & result, double seconds);
+};
+
+ArmyRunner::ArmyRunner(const CreatureDuels::Options & options)
+	: options(options)
+{
+}
+
+DuelServer * ArmyRunner::createServer(const CreatureDuels::Options & options)
+{
+	BattleLimits limits;
+	limits.actions = 5000;
+	limits.duration = std::chrono::seconds(300);
+	return new DuelServer(options.battleAI, 0, true, limits);
+}
+
+boost::filesystem::path ArmyRunner::markerPath() const
+{
+	return boost::filesystem::path(options.output.string() + ".current");
+}
+
+void ArmyRunner::collectJobs()
+{
+	std::ifstream file(options.armyJobs.c_str(), std::ios::binary);
+	if(!file)
+		throw std::runtime_error("Unable to open faction army jobs " + options.armyJobs.string());
+	const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+	const JsonNode root(reinterpret_cast<const std::byte *>(text.data()), text.size(), options.armyJobs.string());
+
+	std::map<std::string, const CCreature *> creatures;
+	for(const auto & creature : LIBRARY->creh->objects)
+		if(creature)
+			creatures[creature->getJsonKey()] = creature.get();
+
+	std::map<std::string, ArtifactID> artifacts;
+	for(const auto & artifact : LIBRARY->arth->objects)
+		if(artifact)
+			artifacts[artifact->getJsonKey()] = artifact->getId();
+
+	std::map<std::string, SecondarySkill> skills;
+	for(size_t index = 0; index < LIBRARY->skillh->size(); ++index)
+	{
+		const SecondarySkill skill(static_cast<int32_t>(index));
+		skills[skill.toSkill()->getJsonKey()] = skill;
+	}
+
+	std::map<std::string, HeroTypeID> heroTypes;
+	for(const auto & hero : LIBRARY->heroh->objects)
+		if(hero)
+			heroTypes[hero->getJsonKey()] = hero->getId();
+
+	std::map<std::string, SpellID> spells;
+	for(const auto & spell : LIBRARY->spellh->objects)
+		if(spell)
+			spells[spell->getJsonKey()] = spell->getId();
+
+	std::map<std::string, const CFaction *> factions;
+	for(const auto & faction : LIBRARY->townh->objects)
+		if(faction)
+			factions[faction->getJsonKey()] = faction.get();
+
+	std::map<std::string, size_t> sideIndex;
+	for(const auto & sideNode : root["sides"].Vector())
+	{
+		ArmySide side;
+		side.id = sideNode["id"].String();
+		side.faction = sideNode["faction"].String();
+		side.experienceRank = static_cast<int>(sideNode["experienceRank"].Integer());
+
+		for(const auto & stackNode : sideNode["army"].Vector())
+		{
+			const auto found = creatures.find(stackNode[0].String());
+			if(found == creatures.end())
+				side.error += "unknown creature " + stackNode[0].String() + "; ";
+			else
+				side.army.push_back({found->second, static_cast<int>(stackNode[1].Integer())});
+		}
+		if(side.army.empty())
+			side.error += "empty army; ";
+		if(side.army.size() > GameConstants::ARMY_SIZE)
+			side.error += "more stacks than a hero can lead; ";
+
+		HeroBuild & build = side.build;
+		build.level = static_cast<int>(sideNode["level"].Integer());
+		for(size_t index = 0; index < build.primary.size(); ++index)
+			build.primary[index] = static_cast<int>(sideNode["primary"][index].Integer());
+
+		const auto hero = heroTypes.find(sideNode["hero"].String());
+		if(hero == heroTypes.end())
+			side.error += "unknown hero " + sideNode["hero"].String() + "; ";
+		else
+			build.heroType = hero->second;
+
+		for(const auto & skillNode : sideNode["skills"].Vector())
+		{
+			const auto found = skills.find(skillNode[0].String());
+			if(found == skills.end())
+				side.error += "unknown skill " + skillNode[0].String() + "; ";
+			else
+				build.skills.emplace_back(found->second, static_cast<int>(skillNode[1].Integer()));
+		}
+		for(const auto & machineNode : sideNode["warMachines"].Vector())
+		{
+			const auto found = artifacts.find(machineNode.String());
+			if(found == artifacts.end())
+				side.error += "unknown war machine " + machineNode.String() + "; ";
+			else
+				build.warMachines.push_back(found->second);
+		}
+		for(const auto & spellNode : sideNode["spells"].Vector())
+		{
+			// a spell a mod no longer has is only left out, it does not stop the side
+			const auto found = spells.find(spellNode.String());
+			if(found != spells.end())
+				build.spells.push_back(found->second);
+			else
+				logGlobal->warn("Faction armies: %s: unknown spell %s", side.id, spellNode.String());
+		}
+
+		const auto faction = factions.find(side.faction);
+		if(faction == factions.end() || !faction->second->town)
+			side.error += "unknown faction " + side.faction + "; ";
+		else
+		{
+			for(const auto & buildingNode : sideNode["buildings"].Vector())
+			{
+				const std::string & name = buildingNode.String();
+				const CBuilding * match = nullptr;
+				for(const auto & [id, building] : faction->second->town->buildings)
+				{
+					const std::string key = building->getJsonKey();
+					if(key == name || boost::algorithm::ends_with(key, ":" + name))
+						match = building.get();
+				}
+				if(match)
+					build.buildings.push_back(match);
+				else
+					logGlobal->warn("Faction armies: %s: town has no building %s", side.id, name);
+			}
+		}
+
+		build.spellbook = sideNode["spellbook"].Bool();
+		build.commander = sideNode["commander"].Bool();
+		build.commanderSeed = stableHash(side.id);
+
+		sideIndex[side.id] = sides.size();
+		sides.push_back(std::move(side));
+	}
+
+	int jobIndex = 0;
+	for(const auto & pairNode : root["pairs"].Vector())
+	{
+		if(jobIndex++ % options.shardCount != options.shardIndex)
+			continue;
+
+		const auto first = sideIndex.find(pairNode[0].String());
+		const auto second = sideIndex.find(pairNode[1].String());
+		if(first == sideIndex.end() || second == sideIndex.end())
+		{
+			logGlobal->error("Faction armies: pair %s, %s names an unknown side", pairNode[0].String(), pairNode[1].String());
+			continue;
+		}
+
+		ArmyJob job;
+		job.first = first->second;
+		job.second = second->second;
+		job.key = sides[job.first].id + "," + sides[job.second].id;
+		jobs.push_back(job);
+	}
+}
+
+void ArmyRunner::loadDone()
+{
+	std::ifstream file(options.output.c_str());
+	std::string line;
+	while(std::getline(file, line))
+	{
+		std::vector<std::string> fields;
+		boost::split(fields, line, boost::is_any_of(","));
+		if(fields.size() > 2)
+			done.insert(fields[0] + "," + fields[1]);
+	}
+}
+
+void ArmyRunner::recoverCrashedJob()
+{
+	std::ifstream marker(markerPath().c_str());
+	std::string key;
+	if(!std::getline(marker, key) || key.empty() || done.count(key))
+		return;
+
+	for(const auto & job : jobs)
+	{
+		if(job.key != key)
+			continue;
+
+		JobResult result;
+		result.status = "crashed";
+		writeResult(job, result, 0);
+		done.insert(key);
+		logGlobal->warn("Faction armies: %s crashed the previous run and is skipped", key);
+	}
+}
+
+JobResult ArmyRunner::measure(const ArmyJob & job)
+{
+	const ArmySide & first = sides[job.first];
+	const ArmySide & second = sides[job.second];
+
+	double firstValue = 0;
+	for(const auto & stack : first.army)
+		firstValue += configuredValue(stack.creature) * stack.count;
+	double secondValue = 0;
+	for(const auto & stack : second.army)
+		secondValue += configuredValue(stack.creature) * stack.count;
+
+	// configured values suggest where the two are even, which saves search steps
+	const double prior = std::clamp(firstValue / std::max(1.0, secondValue), 1.0 / 8.0, 8.0);
+
+	SearchSettings settings;
+	settings.start = prior;
+	settings.lowest = prior / 6.0;
+	settings.highest = prior * 6.0;
+	settings.seedBase = stableHash(job.key);
+	server->describeNextBattle = true;
+
+	// the second side's army is scaled, its hero stays, so the scale it is even at is how much
+	// stronger the first side is, as a factor on the second side's army
+	return searchEquilibrium(settings, [&](double guess, bool subjectAttacks, int seed, double & fielded)
+	{
+		Army scaled;
+		double scaledValue = 0;
+		for(const auto & stack : second.army)
+		{
+			const int count = std::max(1, static_cast<int>(std::lround(stack.count * guess)));
+			scaled.push_back({stack.creature, count});
+			scaledValue += configuredValue(stack.creature) * count;
+		}
+		fielded = scaledValue / std::max(1.0, secondValue);
+
+		if(subjectAttacks)
+		{
+			server->setExperienceRanks(first.experienceRank, second.experienceRank);
+			return server->play(first.army, &first.build, scaled, &second.build, seed);
+		}
+
+		server->setExperienceRanks(second.experienceRank, first.experienceRank);
+		return server->play(scaled, &second.build, first.army, &first.build, seed);
+	});
+}
+
+void ArmyRunner::writeResult(const ArmyJob & job, const JobResult & result, double seconds)
+{
+	const bool newFile = !boost::filesystem::exists(options.output);
+	std::ofstream file(options.output.c_str(), std::ios::app);
+
+	if(newFile)
+		file << "first,second,equilibriumScale,spread,battles,valid,limited,rejected,steps,seconds,status\n";
+
+	file << boost::str(boost::format("%s,%.4f,%.4f,%d,%d,%d,%d,%d,%.1f,%s\n")
+		% job.key
+		% result.equilibriumUnits
+		% result.spread
+		% result.battles
+		% result.valid
+		% result.limited
+		% result.rejected
+		% result.steps
+		% seconds
+		% result.status);
+}
+
+void ArmyRunner::run()
+{
+	collectJobs();
+	loadDone();
+	recoverCrashedJob();
+
+	const size_t remaining = std::count_if(jobs.begin(), jobs.end(), [this](const ArmyJob & job) { return !done.count(job.key); });
+
+	{
+		std::ofstream total(boost::filesystem::path(options.output.string() + ".jobs").c_str());
+		total << jobs.size() << "\n";
+	}
+
+	logGlobal->info("Faction armies: shard %d of %d, %d pairs, %d still to measure",
+		options.shardIndex + 1, options.shardCount, static_cast<int>(jobs.size()), static_cast<int>(remaining));
+
+	server.reset(createServer(options));
+
+	const auto startTime = std::chrono::steady_clock::now();
+	size_t measured = 0;
+
+	for(const auto & job : jobs)
+	{
+		if(done.count(job.key))
+			continue;
+
+		{
+			std::ofstream marker(markerPath().c_str());
+			marker << job.key << "\n";
+		}
+
+		const auto jobStart = std::chrono::steady_clock::now();
+		JobResult result;
+		const std::string error = sides[job.first].error + sides[job.second].error;
+
+		if(!error.empty())
+		{
+			result.status = "error: " + error;
+			boost::replace_all(result.status, ",", ";");
+			logGlobal->error("Faction armies: %s skipped: %s", job.key, error);
+		}
+		else
+		{
+			try
+			{
+				result = measure(job);
+			}
+			catch(const std::exception & e)
+			{
+				result.status = std::string("error: ") + e.what();
+				boost::replace_all(result.status, ",", ";");
+				boost::replace_all(result.status, "\n", " ");
+				logGlobal->error("Faction armies: %s failed: %s", job.key, e.what());
+
+				server.reset();
+				server.reset(createServer(options));
+			}
+		}
+
+		const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - jobStart).count();
+		writeResult(job, result, seconds);
+		done.insert(job.key);
+		++measured;
+
+		const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
+		const double eta = elapsed / measured * (remaining - measured);
+		logGlobal->info("Faction armies: %d/%d %s - %s, %.0f s left", static_cast<int>(measured), static_cast<int>(remaining), job.key, result.status, eta);
+	}
+
+	boost::filesystem::remove(markerPath());
+	logGlobal->info("Faction armies complete");
+}
 }
 
 void CreatureDuels::run(const Options & options)
 {
 	if(options.shardCount < 1 || options.shardIndex < 0 || options.shardIndex >= options.shardCount)
 		throw std::runtime_error("Invalid creature duels shard");
+
+	if(!options.armyJobs.empty())
+	{
+		ArmyRunner runner(options);
+		runner.run();
+		return;
+	}
 
 	if(!options.factionBuilds.empty())
 	{
