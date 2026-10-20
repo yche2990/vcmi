@@ -362,6 +362,11 @@ CCommanderInstance * CGHeroInstance::getCommander()
 	return commander.get();
 }
 
+void CGHeroInstance::replaceCommander(std::unique_ptr<CCommanderInstance> newCommander)
+{
+	commander = std::move(newCommander);
+}
+
 void CGHeroInstance::initObj(IGameRandomizer & gameRandomizer)
 {
 	if (ID == Obj::HERO)

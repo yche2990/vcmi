@@ -274,6 +274,8 @@ public:
 
 	const CCommanderInstance * getCommander() const;
 	CCommanderInstance * getCommander();
+	/// Replaces the commander of the hero, e.g. by one of another creature; takes ownership
+	void replaceCommander(std::unique_ptr<CCommanderInstance> newCommander);
 
 	void initObj(IGameRandomizer & gameRandomizer) override;
 	void initHero(IGameRandomizer & gameRandomizer, bool isFake = false);
